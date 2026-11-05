@@ -1,0 +1,359 @@
+openapi: 3.0.3
+
+info:
+  title: Token API
+  version: 1.0.0
+  description: |
+    Emite tokens de acesso JWT assinados com RS256 seguindo o padrão de
+    interoperabilidade ASTM (ex.: ASTM F3411 Remote ID e ASTM F3548) e publica a
+    chave pública de assinatura como um JWKS, para que qualquer parte possa
+    verificar esses tokens.
+
+    O token emitido é usado para se comunicar com **qualquer serviço do
+    ECO-UTM**: DSS, USSs, Provedor de Zona UTM, etc.
+
+    ## Ambientes
+
+    | Ambiente                     | URL Base                               |
+    |------------------------------|----------------------------------------------|
+    | Desenvolvimento (Sandbox) | `http://api.sandbox.brutm.icea.decea.mil.br` (somente HTTP, sem TLS) |
+    | Produção                     | `https://eco-utm.decea.mil.br`               |
+
+    ## Chave de API
+
+    Cada empresa recebe uma ou mais chaves de API. A chave de API **identifica
+    sistemicamente a empresa que a usa**: o `sub` do token é o username
+    configurado para essa empresa. Quando a dona de um SW-USS aprovado cria uma
+    chave de API para uma empresa terceira que usa o software, os tokens dessa
+    chave levam o `sub` da empresa terceira. O que é igual em todos os tokens é
+    o `iss` (`ICEA`).
+
+    A chave de API pode ser enviada de duas formas na requisição `GET /token`:
+
+    - no header `apikey` (recomendado); ou
+    - no parâmetro de query `apikey`.
+
+    ## Escopo e audiência
+
+    Os parâmetros `intended_audience` e `scope` são sempre enviados como
+    parâmetros de query na requisição `GET /token`.
+
+    - **`intended_audience`** é sempre o **domínio da aplicação que hospeda a
+      API/serviço** que vai receber o token. Só o domínio: sem esquema, sem
+      porta e sem caminho (com `https://uss.empresa-b.com.br:8443/utm`, é
+      `uss.empresa-b.com.br`). Um endereço IP não é aceito.
+    - **`scope`** depende da operação a ser realizada na API de destino: cada
+      operação exige um escopo específico, definido na especificação da API de
+      destino. É possível solicitar um ou mais escopos no mesmo token,
+      separados por espaço.
+
+    Exemplos de escopos:
+
+    | Escopo                          | Norma       |
+    |---------------------------------|-------------|
+    | `utm.strategic_coordination`    | ASTM F3548  |
+    | `utm.constraint_management`     | ASTM F3548  |
+    | `utm.constraint_processing`     | ASTM F3548  |
+    | `utm.conformance_monitoring_sa` | ASTM F3548  |
+    | `utm.availability_arbitration`  | ASTM F3548  |
+    | `rid.service_provider`          | ASTM F3411  |
+    | `rid.display_provider`          | ASTM F3411  |
+
+    **Exemplo:** a Empresa A quer consultar os detalhes de uma Operational
+    Intent gerenciada pelo USS da Empresa B, hospedado em
+    `https://uss.empresa-b.com.br`. A Empresa A solicita um token com:
+
+    - `intended_audience=uss.empresa-b.com.br` (o domínio do USS da Empresa B)
+    - `scope=utm.strategic_coordination` (o escopo exigido por essa operação)
+
+    ## Fluxo típico
+
+    **1. Obter um token** (cliente, com sua chave de API):
+
+    ```bash
+    curl -G "<ECO_UTM_URL>/token" \
+      -H "apikey: <SUA_CHAVE_DE_API>" \
+      --data-urlencode "intended_audience=uss.empresa-b.com.br" \
+      --data-urlencode "scope=utm.strategic_coordination"
+    ```
+
+    ```json
+    {
+      "access_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6Ii4uLiIsInR5cCI6IkpXVCJ9...",
+      "token_type": "Bearer",
+      "expires_in": 3600
+    }
+    ```
+
+    O token tem **validade de 1 hora**.
+
+    **2. Chamar o serviço de destino** com o token:
+
+    ```bash
+    curl "https://uss.empresa-b.com.br/..." -H "Authorization: Bearer <access_token>"
+    ```
+
+    **3. Verificar o token** (o serviço que recebe, sem necessidade de credenciais):
+
+    1. Obtenha o JWKS em `GET <ECO_UTM_URL>/.well-known/jwks.json` (guarde em
+       cache; a resposta pode ficar em cache por 1 hora).
+    2. Leia o `kid` do header do JWT e escolha a JWK do JWKS com o mesmo `kid`.
+    3. Verifique a assinatura do JWT com essa chave do JWKS, usando `alg = RS256`.
+       Rejeite o token se a assinatura for inválida.
+    4. Confira as claims: `iss` é `ICEA`, `aud` é o domínio do seu próprio
+       serviço, `exp` está no futuro e `scope` contém o escopo exigido pelo
+       endpoint.
+
+    O `scope` pode conter **mais de um valor, separados por espaço** (ex.:
+    `utm.strategic_coordination utm.constraint_processing`). O serviço deve
+    dividir a claim pelos espaços e aceitar o token se o escopo exigido
+    estiver entre os valores, e não comparar a string inteira.
+
+    ## Conteúdo do token
+
+    **Header decodificado**
+
+    | Campo | Valor                                                         |
+    |-------|---------------------------------------------------------------|
+    | `alg` | Sempre `RS256`                                                |
+    | `typ` | Sempre `JWT`                                                  |
+    | `kid` | ID da chave de assinatura; corresponde ao `kid` de uma chave do JWKS |
+
+    **Payload decodificado**
+
+    | Claim   | Valor                                                         |
+    |---------|---------------------------------------------------------------|
+    | `iss`   | Sempre `ICEA`                                                 |
+    | `sub`   | Username configurado para a empresa que usa a chave de API (numa chave criada para uma empresa terceira, o da terceira). É esse valor que aparece no campo `manager` das entidades criadas no DSS (como Operational Intent Reference e Constraint Reference) |
+    | `aud`   | Valor do parâmetro de query `intended_audience`               |
+    | `scope` | Valor do parâmetro de query `scope`: um único escopo ou vários, separados por espaço |
+    | `iat`   | Momento da emissão (Unix Time)                                |
+    | `exp`   | `iat` + 3600 (Unix Time)                                      |
+
+    > **Observação:** não há refresh token. Solicite um novo token antes que
+    > o atual expire (`expires_in`, 1 hora).
+
+tags:
+  - name: Token
+    description: Emissão de tokens de acesso assinados
+  - name: JWKS
+    description: Descoberta da chave pública para verificação de tokens
+
+paths:
+  /token:
+    get:
+      tags: [Token]
+      operationId: createToken
+      summary: Emite um token de acesso assinado
+      description: |
+        Emite um JWT assinado com RS256, válido por **1 hora**.
+
+        **Autenticação:** a chave de API da sua empresa, enviada no header
+        `apikey` (recomendado) ou no parâmetro de query `apikey`.
+
+        **Autorização:** a sua empresa precisa ter permissão para solicitar
+        todos os escopos informados em `scope`; caso contrário, a requisição é
+        recusada com `403`.
+      security:
+        - ApiKeyHeader: []
+        - ApiKeyQuery: []
+      parameters:
+        - name: intended_audience
+          in: query
+          required: true
+          description: |
+            Domínio da aplicação que hospeda a API/serviço que vai receber o
+            token. Vai para a claim `aud`. Só o domínio: sem esquema, sem porta
+            e sem caminho. Um endereço IP não é aceito.
+          schema:
+            type: string
+          example: uss.empresa-b.com.br
+        - name: scope
+          in: query
+          required: true
+          description: |
+            Um ou mais escopos solicitados, separados por espaço (codifique os
+            espaços na URL como `%20` ou `+`). O escopo necessário depende da
+            operação a ser realizada na API de destino. Vai para a claim
+            `scope` sem alterações.
+          schema:
+            type: string
+          examples:
+            single:
+              summary: Um escopo
+              value: utm.strategic_coordination
+            multiple:
+              summary: Vários escopos
+              value: utm.strategic_coordination utm.constraint_processing
+      responses:
+        "200":
+          description: Token emitido
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+        "400":
+          description: |
+            Parâmetro obrigatório ausente. O corpo é uma mensagem em texto puro.
+          content:
+            text/plain:
+              schema:
+                type: string
+              examples:
+                missingAudience:
+                  value: Missing `intended_audience` query parameter
+                missingScope:
+                  value: Missing `scope` query parameter
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            A empresa não tem permissão para solicitar um ou mais dos escopos
+            informados.
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /.well-known/jwks.json:
+    get:
+      tags: [JWKS]
+      operationId: getJwks
+      summary: Obtém as chaves públicas de assinatura (JWKS)
+      description: |
+        Retorna a parte pública da chave de assinatura como um JSON Web Key Set
+        (RFC 7517). Público, não exige autenticação.
+
+        Use-o para verificar a assinatura dos tokens emitidos por `/token`:
+        associe o `kid` do header do JWT ao `kid` de uma chave e, em seguida,
+        verifique a assinatura RS256 com `n` e `e`. A maioria das bibliotecas
+        de JWT faz isso automaticamente quando recebe a URL do JWKS.
+
+        A resposta pode ficar em cache por 1 hora (`Cache-Control: public,
+        max-age=3600`). Se chegar um token com um `kid` desconhecido, busque o
+        JWKS novamente uma vez antes de rejeitá-lo, caso a chave tenha sido
+        rotacionada.
+      security: []
+      responses:
+        "200":
+          description: O JSON Web Key Set
+          headers:
+            Cache-Control:
+              description: O JWKS pode ficar em cache por 1 hora
+              schema:
+                type: string
+              example: public, max-age=3600
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JwksResponse"
+        "405":
+          $ref: "#/components/responses/MethodNotAllowed"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+components:
+  securitySchemes:
+    ApiKeyHeader:
+      type: apiKey
+      in: header
+      name: apikey
+      description: |
+        Chave de API da sua empresa, enviada no header `apikey` da requisição
+        `GET /token`. Cada empresa pode ter mais de uma chave de API. A chave
+        identifica a empresa que a usa: o username configurado para essa
+        empresa se torna a claim `sub` do token.
+    ApiKeyQuery:
+      type: apiKey
+      in: query
+      name: apikey
+      description: |
+        A mesma chave de API, enviada como parâmetro de query `apikey` da
+        requisição `GET /token`. Prefira o header: query strings costumam
+        acabar em logs de acesso e no histórico do navegador.
+
+  schemas:
+    TokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+          description: "O JWT assinado (RS256). Envie-o como `Authorization: Bearer <access_token>`."
+          example: eyJhbGciOiJSUzI1NiIsImtpZCI6Ii4uLiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJJQ0VBIn0.c2lnbmF0dXJl
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          format: int64
+          description: Tempo de vida do token em segundos (sempre 1 hora)
+          example: 3600
+
+    JwksResponse:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/Jwk"
+
+    Jwk:
+      type: object
+      description: Chave pública RSA no formato JWK (RFC 7517 / RFC 7518)
+      required: [kty, use, kid, n, e]
+      properties:
+        kty:
+          type: string
+          enum: [RSA]
+          description: Tipo da chave
+        use:
+          type: string
+          enum: [sig]
+          description: Uso da chave (verificação de assinatura)
+        kid:
+          type: string
+          description: ID da chave; corresponde ao header `kid` dos JWTs emitidos
+          example: 3q2-7wAAAAAAAAAAAAAAAAAAAAA=
+        n:
+          type: string
+          description: Módulo RSA, codificado em base64url
+          example: xjlCRBqkOW...
+        e:
+          type: string
+          description: Expoente público RSA, codificado em base64url
+          example: AQAB
+
+  responses:
+    Unauthorized:
+      description: |
+        Nenhuma chave de API foi enviada, ou a chave é inválida.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message:
+                type: string
+          examples:
+            noKey:
+              value:
+                message: No API key found in request
+            invalidKey:
+              value:
+                message: Unauthorized
+    MethodNotAllowed:
+      description: Apenas `GET` é suportado
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: Method Not Allowed
+    InternalServerError:
+      description: Erro inesperado ao assinar ou codificar a resposta
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: Internal Server Error

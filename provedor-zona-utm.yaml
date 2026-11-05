@@ -1,0 +1,535 @@
+openapi: 3.0.2
+info:
+  title: Provedor de Zona UTM
+  version: 1.0.0
+  description: |
+    Informa as Zonas UTM em que cada empresa pode operar. O seu SW-USS **chama** este serviço; não o implementa. O Provedor de Zona UTM faz parte do ECO-UTM e é mantido pelo DECEA.
+
+    ## O que é uma Zona UTM
+
+    Uma Zona UTM é uma alocação especial do espaço aéreo, criada pela empresa no Portal BR-UTM, em acordo com o DECEA, que permite à empresa operar ali. No BR-UTM:
+
+    - **Toda operational intent fica estritamente dentro de uma Zona UTM** a que o SW-USS tem acesso.
+    - A zona é definida por um contorno (polígono ou círculo), uma faixa de altitude, um início de validade e, se for o caso, um fim de validade. Uma zona sem fim de validade vale por tempo indeterminado. Nada limita o tamanho de uma zona.
+    - Uma empresa pode ter várias Zonas UTM. Uma zona fica alocada para sempre à empresa que a criou; nada sobre renovação ou expiração foi definido por enquanto.
+    - Zonas de empresas diferentes podem se sobrepor: outra empresa também pode pedir a mesma área. Ter uma zona não permite que outras empresas operem nela, mas, onde duas empresas operam, a desconflitação acontece só pelo DSS (operational intents e `key`), sem acordo entre elas.
+    - Na Fase 1, as zonas são do tipo `U1`, ligado à permissão `U1` do software aprovado, e ficam somente em espaço aéreo classe G.
+
+    ## Como uma zona é criada
+
+    1. A empresa tem o SW-USS aprovado na homologação (ver `sw-uss-homologacao.yaml`) e cria no Portal BR-UTM a chave de API de produção daquela versão.
+    2. Com essa chave de API, a empresa pede a Zona UTM no Portal BR-UTM.
+    3. Assim que a zona é criada, ela aparece neste serviço, e o SW-USS pode criar operações nela com a chave de API usada.
+
+    A empresa dona de um SW-USS aprovado também pode criar chaves de API para empresas terceiras que compram o software; a terceira usa essa chave para escolher a Zona UTM em que quer operar. No ambiente de desenvolvimento, por enquanto, as Zonas UTM são pedidas informalmente à equipe de desenvolvimento do BR-UTM pelo Mattermost; a equipe cria cada zona à mão, com os dados pedidos.
+
+    ## Como o seu SW-USS usa
+
+    1. **Obtenha as zonas a que tem acesso** em `GET /zonautm/v1/zones`. A resposta traz só as zonas em que a sua empresa está em `reference.manager`, isto é, as zonas em que o `sub` do token (o username da empresa) aparece.
+    2. **A cada pedido de voo, verifique se o voo está estritamente dentro de alguma dessas zonas**: contorno, altitudes e tempo. No tempo, o voo deve começar depois do `time_start` do volume da zona e, se o volume tiver `time_end`, terminar antes dele; um volume sem `time_end` não tem fim. Se o voo estiver dentro, siga com o pedido (consulta ao DSS, desconflitação, criação da operational intent). Se não estiver, rejeite o pedido.
+
+    ## URL base e autenticação
+
+    Os caminhos deste arquivo ficam sob a URL base do API Gateway do ambiente (ver `servers`), como os do DSS. Chame com `Authorization: Bearer <token>`, um token obtido em `GET /token` (ver `token.yaml`) com:
+
+    - `intended_audience`: o domínio do Provedor de Zona UTM, isto é, o host da URL base (ex.: `api.sandbox.brutm.icea.decea.mil.br`). Se o serviço estiver publicado em mais de um domínio, cada um deles é aceito como `aud`.
+    - `scope`: o token precisa conter `utm.zone_processing`. Ele pode levar outros escopos, separados por espaço, junto com este.
+    - O `sub` do token identifica a sua empresa e define quais zonas ela vê (ver `reference.manager`).
+
+    Os erros vêm no corpo como `{"message": "..."}`.
+servers:
+- url: http://api.sandbox.brutm.icea.decea.mil.br
+  description: Desenvolvimento (somente HTTP, sem TLS)
+- url: https://eco-utm.decea.mil.br
+  description: Produção
+security:
+- Authority:
+  - utm.zone_processing
+tags:
+- name: Zonas UTM
+  description: Endpoints do Provedor de Zona UTM que informam as Zonas UTM de cada empresa.
+paths:
+  /zonautm/v1/zones:
+    get:
+      tags:
+      - Zonas UTM
+      security:
+      - Authority:
+        - utm.zone_processing
+      summary: Lista as Zonas UTM da sua empresa
+      operationId: listUtmZones
+      description: |
+        **Escopo exigido no token de quem chama:** `utm.zone_processing`
+
+        **Quem chama:** os SW-USS, para saber em que Zonas UTM podem operar.
+
+        Devolve todas as Zonas UTM em que a sua empresa, identificada pelo `sub` do token, está em `reference.manager`. Zonas de outras empresas não aparecem. Se a sua empresa não tiver nenhuma zona, `zones` vem vazio.
+
+        Use a lista para verificar, a cada pedido de voo, se o voo está estritamente dentro de alguma zona; se não estiver, rejeite o pedido.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListUtmZonesResponse'
+              examples:
+                duasZonas:
+                  summary: Empresa com duas Zonas UTM em São Paulo, uma delas sem fim de validade
+                  value:
+                    zones:
+                    - reference:
+                        id: 5b0c9f7e-3d2a-4e8b-9c1f-6a7d2e4b8c10
+                        type: U1
+                        manager:
+                        - empresa-a
+                      details:
+                        volumes:
+                        - volume:
+                            outline_circle:
+                              center:
+                                lat: -23.5505
+                                lng: -46.6333
+                              radius:
+                                value: 5000.0
+                                units: M
+                            altitude_lower:
+                              value: 0.0
+                              reference: W84
+                              units: M
+                            altitude_upper:
+                              value: 150.0
+                              reference: W84
+                              units: M
+                          time_start:
+                            value: '2026-01-01T00:00:00Z'
+                            format: RFC3339
+                    - reference:
+                        id: c2e7a1d4-8f36-4b9e-a052-1d9e7f3b6a84
+                        type: U1
+                        manager:
+                        - empresa-a
+                        - empresa-b
+                      details:
+                        volumes:
+                        - volume:
+                            outline_polygon:
+                              vertices:
+                              - lat: -23.53
+                                lng: -46.60
+                              - lat: -23.53
+                                lng: -46.55
+                              - lat: -23.57
+                                lng: -46.55
+                              - lat: -23.57
+                                lng: -46.60
+                            altitude_lower:
+                              value: 0.0
+                              reference: W84
+                              units: M
+                            altitude_upper:
+                              value: 120.0
+                              reference: W84
+                              units: M
+                          time_start:
+                            value: '2026-03-01T00:00:00Z'
+                            format: RFC3339
+                          time_end:
+                            value: '2027-12-31T23:59:59Z'
+                            format: RFC3339
+                semZonas:
+                  summary: Empresa sem Zonas UTM
+                  value:
+                    zones: []
+          description: As Zonas UTM da sua empresa foram obtidas com sucesso.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                semToken:
+                  summary: Header Authorization ausente
+                  value:
+                    message: Authorization header with Bearer token is required.
+                expirado:
+                  summary: Token expirado
+                  value:
+                    message: Token has expired.
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado, é inválido ou expirou.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                escopo:
+                  summary: Token sem o escopo exigido
+                  value:
+                    message: "Insufficient scope. Required: 'utm.zone_processing'."
+          description: >-
+            O token de acesso foi decodificado, mas o `scope` não contém `utm.zone_processing`.
+  /zonautm/v1/zones/{zone_id}:
+    parameters:
+    - name: zone_id
+      in: path
+      required: true
+      description: Identificador da Zona UTM (`reference.id`).
+      schema:
+        $ref: '#/components/schemas/UtmZoneID'
+      example: 5b0c9f7e-3d2a-4e8b-9c1f-6a7d2e4b8c10
+    get:
+      tags:
+      - Zonas UTM
+      security:
+      - Authority:
+        - utm.zone_processing
+      summary: Obtém uma Zona UTM da sua empresa
+      operationId: getUtmZone
+      description: |
+        **Escopo exigido no token de quem chama:** `utm.zone_processing`
+
+        **Quem chama:** os SW-USS, para obter uma Zona UTM específica.
+
+        Devolve a Zona UTM com o `id` informado, se a sua empresa (o `sub` do token) estiver em `reference.manager`.
+
+        - Responde `400` se o `zone_id` não for um UUIDv4 válido, sem procurar a zona.
+        - Responde `404` se não existir zona com esse `id`.
+        - Responde `403` se a zona existir, mas a sua empresa não estiver em `reference.manager`.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UtmZone'
+              examples:
+                zona:
+                  summary: Zona UTM circular no centro de São Paulo, sem fim de validade
+                  value:
+                    reference:
+                      id: 5b0c9f7e-3d2a-4e8b-9c1f-6a7d2e4b8c10
+                      type: U1
+                      manager:
+                      - empresa-a
+                    details:
+                      volumes:
+                      - volume:
+                          outline_circle:
+                            center:
+                              lat: -23.5505
+                              lng: -46.6333
+                            radius:
+                              value: 5000.0
+                              units: M
+                          altitude_lower:
+                            value: 0.0
+                            reference: W84
+                            units: M
+                          altitude_upper:
+                            value: 150.0
+                            reference: W84
+                            units: M
+                        time_start:
+                          value: '2026-01-01T00:00:00Z'
+                          format: RFC3339
+          description: A Zona UTM foi obtida com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                idMalformado:
+                  summary: zone_id fora do formato UUIDv4
+                  value:
+                    message: "Invalid UTM zone id 'UTM-23S-SP': must be a UUIDv4."
+          description: O `zone_id` informado não é um UUIDv4 válido.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                semToken:
+                  summary: Header Authorization ausente
+                  value:
+                    message: Authorization header with Bearer token is required.
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado, é inválido ou expirou.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                naoManager:
+                  summary: A sua empresa não está em reference.manager
+                  value:
+                    message: "Consumer 'empresa-c' is not authorized to access UTM zone '5b0c9f7e-3d2a-4e8b-9c1f-6a7d2e4b8c10'."
+                escopo:
+                  summary: Token sem o escopo exigido
+                  value:
+                    message: "Insufficient scope. Required: 'utm.zone_processing'."
+          description: >-
+            O `scope` do token não contém `utm.zone_processing`, ou a sua empresa não está em `reference.manager` da zona pedida.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                naoEncontrada:
+                  summary: Zona UTM inexistente
+                  value:
+                    message: "UTM zone '0d4f8e21-7c5b-4a93-b6e2-9f1a3c8d5e70' not found."
+          description: Não existe Zona UTM com o `zone_id` informado.
+components:
+  securitySchemes:
+    Authority:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: /token
+          scopes:
+            utm.zone_processing: >-
+              O cliente pode consultar as Zonas UTM em que a sua empresa pode operar.
+      description: |
+        Token de acesso JWT emitido pelo Auth Server do BR-UTM em `GET /token` (ver `token.yaml`). O tipo `oauth2` é usado aqui só para declarar o escopo das operações: o BR-UTM não usa o fluxo OAuth *client credentials*.
+
+        Envie o token no header `Authorization: Bearer <token>`, com `aud` igual ao domínio do Provedor de Zona UTM e `scope` contendo `utm.zone_processing` (a claim pode ter vários escopos, separados por espaço).
+  schemas:
+    UtmZoneID:
+      description: >-
+        Identificador de uma Zona UTM, no formato UUIDv4, atribuído pelo BR-UTM quando a zona é criada no Portal BR-UTM.
+      type: string
+      format: uuid
+      minLength: 36
+      maxLength: 36
+      pattern: >-
+        ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$
+      example: 5b0c9f7e-3d2a-4e8b-9c1f-6a7d2e4b8c10
+    UtmZoneReference:
+      description: Identificação, tipo e empresas de uma Zona UTM.
+      type: object
+      required:
+      - id
+      - type
+      - manager
+      properties:
+        id:
+          $ref: '#/components/schemas/UtmZoneID'
+        type:
+          description: >-
+            Tipo da Zona UTM. Na Fase 1, todas as zonas são `U1`. Os demais tipos ainda não foram definidos.
+          type: string
+          example: U1
+        manager:
+          description: >-
+            Usernames das empresas que podem operar na zona: o mesmo valor do `sub` dos tokens de cada empresa (ver `token.yaml`).
+          type: array
+          items:
+            type: string
+          example:
+          - empresa-a
+    UtmZoneDetails:
+      description: Volumes de uma Zona UTM.
+      type: object
+      required:
+      - volumes
+      properties:
+        volumes:
+          description: >-
+            Volumes que formam a Zona UTM. Todo volume traz um contorno (`outline_circle` ou `outline_polygon`), `altitude_lower`, `altitude_upper` e `time_start`; `time_end` só vem se o volume tiver fim de validade.
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/UtmZoneVolume4D'
+    UtmZone:
+      description: Zona UTM completa.
+      type: object
+      required:
+      - reference
+      - details
+      properties:
+        reference:
+          $ref: '#/components/schemas/UtmZoneReference'
+        details:
+          $ref: '#/components/schemas/UtmZoneDetails'
+    ListUtmZonesResponse:
+      description: Zonas UTM da empresa que chamou.
+      type: object
+      required:
+      - zones
+      properties:
+        zones:
+          description: Zonas UTM em que a empresa do token está em `reference.manager`. Vazio se não houver nenhuma.
+          type: array
+          items:
+            $ref: '#/components/schemas/UtmZone'
+    ErrorResponse:
+      description: >-
+        Texto legível devolvido quando uma requisição ao Provedor de Zona UTM resulta em erro.
+      type: object
+      properties:
+        message:
+          description: Mensagem legível que indica o erro e/ou o motivo.
+          type: string
+          example: "UTM zone '0d4f8e21-7c5b-4a93-b6e2-9f1a3c8d5e70' not found."
+    Time:
+      required:
+      - value
+      - format
+      type: object
+      properties:
+        value:
+          type: string
+          description: >-
+            Data e hora no formato RFC 3339. O fuso horário deve ser 'Z'.
+          format: date-time
+          example: '1985-04-12T23:20:50.52Z'
+        format:
+          type: string
+          enum:
+          - RFC3339
+    Radius:
+      required:
+      - value
+      - units
+      type: object
+      properties:
+        value:
+          format: float
+          description: >-
+            Distância a partir do centro de uma área circular, sobre o elipsoide WGS84.
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+          example: 300.183
+        units:
+          type: string
+          description: >-
+            Unidades compatíveis com FIXM. No UTM, só metros ("M") são aceitos.
+          enum:
+          - M
+    Altitude:
+      type: object
+      required:
+      - value
+      - reference
+      - units
+      properties:
+        value:
+          description: >-
+            Valor numérico da altitude. Os valores mínimo e máximo servem como verificação de sanidade e podem ser revistos à medida que novas unidades ou referenciais forem permitidos.
+          type: number
+          format: double
+          minimum: -8000
+          exclusiveMinimum: false
+          maximum: 100000
+          exclusiveMaximum: false
+        reference:
+          description: >-
+            Código do referencial da distância vertical. Ver AIXM 5.1 e FIXM 4.2.0. Hoje o UTM só aceita WGS84, sem planos imediatos de aceitar outros. FIXM e AIXM aceitam 'SFC', equivalente a AGL.
+          type: string
+          enum:
+          - W84
+        units:
+          description: >-
+            Unidade usada para expressar a altitude. Ver FIXM 4.2. Hoje o UTM só aceita metros, sem planos imediatos de aceitar outras.
+          type: string
+          enum:
+          - M
+    Latitude:
+      description: >-
+        Graus de latitude ao norte do equador, em relação ao elipsoide WGS84.
+      maximum: 90
+      exclusiveMaximum: false
+      minimum: -90
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: 34.123
+    Longitude:
+      description: >-
+        Graus de longitude a leste do meridiano de Greenwich, em relação ao elipsoide WGS84.
+      minimum: -180
+      exclusiveMaximum: false
+      maximum: 180
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: -118.456
+    Polygon:
+      description: >-
+        Área fechada sobre a Terra. As arestas do polígono são os caminhos mais curtos entre vértices consecutivos. Isso significa, por exemplo, que a aresta entre dois pontos de mesma latitude em geral não fica sobre essa latitude. A ordem dos vértices deve ser interpretada como a que produz a menor área. As arestas não podem se cruzar e os vértices não podem se repetir; em particular, o último vértice não pode ser igual ao primeiro.
+      required:
+      - vertices
+      type: object
+      properties:
+        vertices:
+          minItems: 3
+          type: array
+          items:
+            $ref: '#/components/schemas/LatLngPoint'
+    LatLngPoint:
+      description: Ponto na superfície da Terra.
+      required:
+      - lat
+      - lng
+      type: object
+      properties:
+        lng:
+          $ref: '#/components/schemas/Longitude'
+        lat:
+          $ref: '#/components/schemas/Latitude'
+    Circle:
+      description: Área circular na superfície da Terra.
+      type: object
+      properties:
+        center:
+          $ref: '#/components/schemas/LatLngPoint'
+        radius:
+          $ref: '#/components/schemas/Radius'
+    Volume3D:
+      description: >-
+        Volume geográfico tridimensional formado pela extrusão vertical de uma forma. Deve ser informado exatamente um contorno.
+      type: object
+      properties:
+        outline_circle:
+          anyOf:
+          - $ref: '#/components/schemas/Circle'
+          description: Forma geográfica circular na superfície da Terra.
+        outline_polygon:
+          anyOf:
+          - $ref: '#/components/schemas/Polygon'
+          description: >-
+            Forma geográfica poligonal na superfície da Terra.
+        altitude_lower:
+          description: >-
+            Altitude mínima do volume. Se informada, deve ser menor que `altitude_upper`.
+          anyOf:
+          - $ref: '#/components/schemas/Altitude'
+        altitude_upper:
+          description: >-
+            Altitude máxima do volume. Se informada, deve ser maior que `altitude_lower`.
+          anyOf:
+          - $ref: '#/components/schemas/Altitude'
+    UtmZoneVolume4D:
+      description: >-
+        Bloco contínuo de espaço-tempo geográfico que forma uma Zona UTM. Igual ao `Volume4D` dos demais serviços, mas com `time_start` obrigatório e `time_end` opcional: um volume sem `time_end` vale por tempo indeterminado.
+      required:
+      - volume
+      - time_start
+      type: object
+      properties:
+        volume:
+          $ref: '#/components/schemas/Volume3D'
+        time_start:
+          description: Início da validade do volume. Deve ser anterior a `time_end`, se houver.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: >-
+            Fim da validade do volume. Deve ser posterior a `time_start`. Ausente quando o volume não tem fim de validade; nesse caso, o campo não vem na resposta (não vem como `null`).
+          anyOf:
+          - $ref: '#/components/schemas/Time'

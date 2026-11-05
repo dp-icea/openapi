@@ -1,0 +1,3238 @@
+openapi: 3.0.2
+info:
+  title: SW-USS
+  version: 1.0.0
+  description: |
+    Endpoints que todo SW-USS (Gerenciador de Operações) expõe aos demais participantes do BR-UTM. O seu SW-USS também chama estes mesmos endpoints nos outros SW-USS: o contrato é o mesmo nos dois sentidos.
+
+    ## O que é o SW-USS
+
+    O SW-USS é o sistema que fica entre o operador, de um lado, e o ECO-UTM, do outro: o Auth Server, o DSS, o Provedor de Zona UTM, os Gerenciadores de Constraints e os demais SW-USS. É por ele que o operador voa o drone e que o restante do UTM fica sabendo dessas operações.
+
+    O SW-USS não é necessariamente um único programa ou uma única API REST. Ele pode ser desde uma única API REST até um conjunto de várias APIs, interfaces gráficas, estações de controle de solo (GCS), gerenciamento de usuários etc. O que vale é o conjunto:
+
+    - **Na homologação, o BR-UTM Lab valida o sistema inteiro**, não uma API isolada.
+    - **Os logs que o DECEA pede são os do sistema inteiro**, de todas as suas partes.
+    - **O SW-USS pode responder em vários domínios** (ver "URLs base e domínios").
+
+    Uma única API REST em um único domínio é o arranjo mais simples, mas o BR-UTM aceita arranjos mais complexos, se o SW-USS precisar.
+
+    ## URLs base e domínios
+
+    Cada endpoint deste arquivo é chamado na URL base que o seu SW-USS registrou na entidade correspondente:
+
+    - **`uss_base_url` da operational intent reference:** `GET /uss/v1/operational_intents/{entityid}` e `GET /uss/v1/operational_intents/{entityid}/telemetry`.
+    - **`uss_base_url` da subscription do UTM** (implícita ou não): `POST /uss/v1/operational_intents` e `POST /uss/v1/constraints`.
+    - **`uss_base_url` da Identification Service Area:** `GET /uss/flights`, `GET /uss/flights/{id}/details` e `GET /uss/identification_service_areas/{id}`.
+    - **`uss_base_url` da subscription do Remote ID:** `POST /uss/identification_service_areas/{id}`.
+    - **Endpoints de logs** (`GET /uss/v1/log_sets` e `GET /uss/v1/log_sets/{log_set_id}`): a URL base (ou as URLs base) informada ao DECEA no final da homologação. O DECEA registra essas URLs só para uso interno; nenhum outro participante as usa.
+
+    Essas URLs podem ser diferentes. Por exemplo, o SW-USS pode responder as operational intents em `https://oi.empresa-a.com.br` e os dados do Remote ID em `https://isa.empresa-a.com.br`, desde que cada referência registre a URL certa. Em todos os casos:
+
+    - A URL base precisa ser acessível publicamente na internet e não pode terminar com `/`.
+    - Os caminhos deste arquivo são acrescentados à URL base. Ex.: com `https://oi.empresa-a.com.br`, os detalhes ficam em `https://oi.empresa-a.com.br/uss/v1/operational_intents/{entityid}`.
+    - O domínio de cada URL base é o `aud` dos tokens enviados a ela: quem chama pede o token com `intended_audience` igual a esse domínio, e a parte do seu SW-USS que responde nele confere que o `aud` é o seu próprio domínio.
+
+    ## Remote ID: Service Provider e Display Provider
+
+    O Remote ID em rede (ASTM F3411) tem dois papéis, que o mesmo SW-USS pode exercer:
+
+    - **Service Provider:** o papel de quem gerencia os voos. Durante o voo, recebe as posições dos seus drones e as fornece a quem pede, em `GET /uss/flights` e `GET /uss/flights/{id}/details`. Para ser encontrado, declara no DSS, por meio de uma Identification Service Area (ISA), a área e o intervalo de tempo em que tem voos. **No BR-UTM, todo SW-USS é Service Provider dos seus voos: fornecer a telemetria dos drones em operações ativas é obrigatório.**
+    - **Display Provider:** o papel de quem mostra o tráfego. Agrega os dados de Remote ID de todos os Service Providers que têm voos numa área e os entrega a um aplicativo de exibição (por exemplo, um mapa). Descobre os Service Providers da área pelas ISAs no DSS, é avisado de ISAs novas pelas suas subscriptions do Remote ID (`POST /uss/identification_service_areas/{id}`) e consulta `GET /uss/flights` em cada um. **No BR-UTM, ser Display Provider é opcional:** consumir a telemetria de outros SW-USS é recomendado, mas não obrigatório. O DECEA acompanha o tráfego dessa forma.
+
+    ## Requisitos de implementação
+
+    O que o SW-USS precisa fazer para operar no BR-UTM, organizado como sugestões de operações. Os endpoints deste arquivo são os exigidos para a interoperabilidade, não os únicos que o SW-USS pode ter.
+
+    1. **Interface do operador.** É por onde o operador pede, acompanha, ativa e encerra voos. A forma fica a critério da empresa: interfaces gráficas, uma API própria de planejamento de voo, integração com estações de controle de solo etc. O BR-UTM não padroniza esta parte.
+    2. **Planejamento e desconflitação.** Para cada pedido de voo:
+       - Verifique se a posição do voo está estritamente dentro de uma Zona UTM a que o SW-USS tem acesso (Provedor de Zona UTM, ver `provedor-zona-utm.yaml`).
+       - Consulte no DSS as operational intents e as constraints da área, e busque os detalhes nos SW-USS que as gerenciam e no Gerenciador de Constraints.
+       - Verifique os conflitos com os volumes exatos. Nenhuma operational intent pode intersectar outra, seja o voo VLOS ou BVLOS, e volumes que só se encostam não conflitam. Em Zona UTM do tipo U1, use prioridade `1`.
+       - Crie a operational intent reference no DSS (`Accepted`), com uma subscription que notifica constraints, e notifique os subscribers.
+
+       Antes de ativar, verifique tudo de novo. O DSS não rejeita a ativação de operational intents que se intersectam: cabe ao SW-USS verificar. Entre operational intents de mesma prioridade, vale a que foi ativada primeiro; entre prioridades diferentes, a de prioridade maior pode ser ativada mesmo intersectando uma de prioridade menor (ver o schema `Priority`). Uma operational intent que intersecta uma constraint não pode ser ativada.
+    3. **Atendimento aos outros participantes.** O SW-USS responde aos endpoints deste arquivo: fornece os detalhes das suas operational intents a quem os pede, recebe as notificações de mudança em operational intents e constraints da área e fornece a telemetria dos seus voos ao Remote ID. Cada endpoint diz quem o chama.
+    4. **Dados das operações.**
+       - Das suas operational intents, o SW-USS mantém os detalhes completos, o OVN atual, a versão e a subscription, para responder aos pedidos de detalhes e alterá-las no DSS.
+       - As operational intents e constraints de outros, recebidas por notificação ou consulta, não precisam ser guardadas. Mas o SW-USS deve usá-las para adaptar as operações afetadas e fazer a coordenação estratégica: por exemplo, avisar o operador de um novo conflito ou de uma constraint que impede a ativação.
+       - Se uma constraint, ou uma operational intent de prioridade maior, intersectar uma operação sua, o SW-USS altera a operação para eliminar a interseção ou a encerra. Se a operação estiver `Activated`, o prazo é de cinco minutos, contados do recebimento da notificação (mesmo que a constraint ou a outra operação só comece depois) ou de quando o SW-USS encontra a interseção numa consulta: nesse prazo, a operational intent é alterada ou encerrada no DSS e o drone sai da interseção ou pousa. O prazo não vale para `Nonconforming` e `Contingent`, estados que já tratam de problemas na operação.
+       - Para o Remote ID, o SW-USS mantém a telemetria recente de cada voo ativo.
+    5. **Monitoramento de conformidade.** Durante o voo, o SW-USS compara continuamente a telemetria do drone com os volumes da operational intent ativa:
+       - Drone dentro dos volumes: a operational intent fica em `Activated`.
+       - Drone fora dos volumes: a operational intent passa para `Nonconforming`. Ela mantém `volumes` e ganha `off_nominal_volumes`.
+       - Drone de volta aos volumes: a operational intent volta para `Activated`.
+       - Drone fora dos volumes por mais de 60 segundos: a operational intent passa para `Contingent`, com `volumes` vazio e só `off_nominal_volumes`. De `Contingent` não há volta.
+
+       O tamanho e a forma dos `off_nominal_volumes` ficam a critério do SW-USS. A ideia é que eles cubram uma área maior que a original, para que mais operações próximas sejam notificadas de que um drone saiu do planejado. Cada mudança de estado é atualizada no DSS (o que exige o escopo `utm.conformance_monitoring_sa`) e notificada aos subscribers.
+    6. **Remote ID (Service Provider).** Ao ativar a operational intent, o SW-USS cria a ISA no DSS. Durante o voo, serve a telemetria em `GET /uss/flights` e `GET /uss/flights/{id}/details`, atualizada no mínimo a cada 10 segundos. Ao fim do voo, remove a operational intent e a ISA.
+    7. **Tokens para chamar o ECO-UTM.** O SW-USS obtém tokens em `GET /token` (ver `token.yaml`), com `intended_audience` igual ao domínio de quem será chamado (só o domínio, sem esquema, porta ou caminho). Um token pode levar vários escopos, separados por espaço, e todos eles devem ser considerados: ao pedir o token, inclua todos os escopos que as chamadas vão exigir. O token vale 1 hora; guardá-lo até perto do `exp` evita pedidos desnecessários.
+    8. **Validação dos tokens recebidos.** Em toda requisição: assinatura conferida com o JWKS do Auth Server, `iss` igual a `ICEA`, `aud` igual ao domínio em que a requisição chegou, `exp` no futuro e `scope` com o escopo exigido pelo endpoint. Divida a claim `scope` pelos espaços e aceite o token se o escopo exigido estiver entre os valores; não compare a string inteira.
+    9. **Notificador.** Depois de cada criação, mudança de estado, alteração ou remoção no DSS, o SW-USS notifica cada SW-USS listado em `subscribers`. Se um deles estiver fora do ar, não é preciso repetir a chamada nem desistir da operação: o SW-USS declara esse SW-USS `Down` no DSS (item 12).
+    10. **Relógio.** Sincronizado por NTP. Por enquanto, o servidor NTP usado é `a.ntp.br`.
+    11. **Logs.** O SW-USS registra os logs do sistema inteiro, de todas as suas partes e domínios, e os organiza em log sets (ver "Logs e ocorrências").
+    12. **Disponibilidade.** O SW-USS informa ao DSS, em `PUT /dss/v1/uss_availability/{uss_id}` (ver `dss.yaml`), a própria disponibilidade e a de outro SW-USS que esteja fora do ar: se não conseguir obter de outro SW-USS o OVN de uma operational intent dele, ou notificá-lo, declara esse SW-USS `Down`, e o DSS passa a aceitar a operational intent reference sem esse OVN, nos casos descritos em `PUT /dss/v1/uss_availability/{uss_id}`. As duas coisas são obrigatórias: todo SW-USS em produção recebe o escopo `utm.availability_arbitration`.
+
+    Se o SW-USS ficar fora do ar durante um voo ativo, sem conseguir se comunicar com o ECO-UTM (o conjunto dos serviços do BR-UTM e de todos os SW-USS), ele deve cancelar todas as operações e orientar o operador a pousar os drones.
+
+    ## Logs e ocorrências
+
+    O SW-USS registra os logs do sistema inteiro, de todas as suas partes e domínios. Isso inclui: as mensagens trocadas com qualquer participante do ECO-UTM (o Auth Server, o DSS, o Provedor de Zona UTM, os Gerenciadores de Constraints, os outros SW-USS etc.), nos dois sentidos, inclusive as que ficaram sem resposta, e não só as trocadas com o DSS e com outros SW-USS, que a ASTM F3548-21 (§5.9) pede; os avisos dados ao operador e as entradas dele; qual operador é responsável por cada operational intent; as tentativas de planejamento negadas por conflito; e as posições do drone usadas no monitoramento de conformidade. Todos os horários ficam em UTC, sem ajuste local, e correspondem ao momento do evento.
+
+    Os logs são organizados em **log sets**, que o DECEA lista em `GET /uss/v1/log_sets` e obtém em `GET /uss/v1/log_sets/{log_set_id}`:
+
+    - **Log set de operação** (`type: operational_intent`): um por operational intent, com `log_set_id` igual ao `entityid` dela. Reúne tudo o que aconteceu na operação, do planejamento ao encerramento.
+    - **Log set de ocorrência** (`type: ocorrencia`): um por ocorrência, com `log_set_id` igual a um UUIDv4 gerado pelo SW-USS quando detecta a ocorrência. Reúne os logs ligados a ela, as operational intents envolvidas e uma descrição do que aconteceu.
+
+    **Ocorrências.** A ICA 100-48 (Art. 40) obriga o SW-USS a notificar toda ocorrência, e considera ocorrências:
+
+    1. extrapolar o próprio volume operacional (`extrapolar_volume_operacional`), por exemplo quando o drone sai dos volumes e a operational intent passa para `Nonconforming`;
+    2. ingressar inadvertidamente em outro volume operacional (`ingressar_outro_volume_operacional`);
+    3. impactar a operação de uma aeronave tripulada (`impactar_aeronave_tripulada`);
+    4. perder a conectividade entre o operador UAS e o SW-USS (`perda_conectividade_operador`).
+
+    Crie o log set da ocorrência assim que ela for detectada. A forma de notificar o DECEA de cada ocorrência ainda não foi definida; enquanto isso, ela fica disponível na listagem de log sets.
+
+    **Retenção.** Pela ICA 100-48 (Art. 39), os dados ficam guardados por até 30 dias corridos e, em caso de incidente ou de pedido de investigação, por até 5 anos.
+
+    ## Autenticação
+
+    Os outros participantes chamam o seu SW-USS com `Authorization: Bearer <token>`, um token emitido pelo Auth Server do BR-UTM com `aud` igual ao domínio chamado. Cada operação informa, no início da descrição e em `security`, o escopo que o token de quem chama precisa ter, e quem costuma chamá-la. Responda `401` a um token ausente ou inválido e `403` a um token sem o escopo exigido.
+
+    ## Schemas
+
+    Schemas do Remote ID com o mesmo nome de um schema UTM, mas conteúdo diferente, recebem o prefixo `Rid` (ex.: `RidVolume4D`).
+servers:
+- url: '{uss_base_url}'
+  description: URL base do SW-USS, a mesma registrada no DSS
+  variables:
+    uss_base_url:
+      default: https://uss.empresa-a.com.br/utm
+      description: URL base do SW-USS, sem `/` no fim
+security:
+- Authority:
+  - utm.strategic_coordination
+  - utm.conformance_monitoring_sa
+  - utm.aviation_authority
+  - utm.constraint_management
+  - utm.constraint_processing
+  - utm.availability_arbitration
+  - rid.display_provider
+  - rid.service_provider
+tags:
+- name: Operational Intents
+  description: >-
+    Endpoints de operational intents: o SW-USS fornece os detalhes e a telemetria das suas operational intents e recebe as notificações de mudança nas operational intents de outros SW-USS.
+- name: Constraints
+  description: >-
+    Endpoint em que o SW-USS recebe as notificações de mudança em constraints.
+- name: Reports
+  description: Endpoint em que o SW-USS recebe relatos de problemas.
+- name: Logs
+  description: >-
+    Endpoints em que o DECEA obtém os logs do SW-USS.
+- name: Remote ID (Service Provider)
+  description: 'Endpoints que o SW-USS expõe como Service Provider do Remote ID: fornece a telemetria e os detalhes dos seus voos.'
+- name: Remote ID (Display Provider)
+  description: 'Endpoint que o SW-USS expõe se for Display Provider do Remote ID: recebe as notificações de ISAs na área das suas subscriptions do Remote ID.'
+paths:
+  /uss/v1/operational_intents/{entityid}:
+    summary: Consulta os detalhes de uma operational intent em um SW-USS.
+    parameters:
+    - name: entityid
+      description: EntityID da operational intent.
+      schema:
+        $ref: '#/components/schemas/EntityID'
+      in: path
+      required: true
+    get:
+      tags:
+      - Operational Intents
+      security:
+      - Authority:
+        - utm.strategic_coordination
+      summary: Fornece os detalhes de uma operational intent
+      description: |
+        **Escopo exigido no token de quem chama:** `utm.strategic_coordination`
+
+        **Quem chama:** outros SW-USS que encontraram a operational intent no DSS.
+
+        Devolve os detalhes (e a referência) de uma operational intent gerenciada pelo seu SW-USS. Os outros SW-USS chamam este endpoint depois de encontrar a referência no DSS, para obter os volumes exatos, a prioridade e o OVN, que eles vão incluir na `key` ao criar ou alterar as próprias operational intents.
+
+        - Devolva a última versão que o DSS aceitou. Enquanto uma alteração no DSS estiver pendente, continue devolvendo a versão anterior; antes de o DSS confirmar a criação, responda `404`.
+        - Preencha `reference.ovn` com o OVN atual: é com ele que os outros SW-USS provam ao DSS que leram a sua operational intent.
+        - Preencha `details.volumes` e `details.off_nominal_volumes` de acordo com o estado (ver o schema `OperationalIntentDetails`).
+        - Responda `404` se o ID não for de uma operational intent gerenciada pelo seu SW-USS.
+
+        No BR-UTM, este endpoint é obrigatório.
+      operationId: getOperationalIntentDetails
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetOperationalIntentDetailsResponse'
+              examples:
+                ativa:
+                  summary: Operational intent ativa da empresa-a
+                  value:
+                    operational_intent:
+                      reference:
+                        id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                        manager: empresa-a
+                        uss_availability: Unknown
+                        version: 2
+                        state: Activated
+                        ovn: 6LsTWURy3osoT7kkrJc3VuPyGbuc7TOK0l7kfkv8hYI_
+                        time_start: &id001
+                          value: '2026-11-05T14:00:00Z'
+                          format: RFC3339
+                        time_end: &id002
+                          value: '2026-11-05T14:30:00Z'
+                          format: RFC3339
+                        uss_base_url: https://uss.empresa-a.com.br/utm
+                        subscription_id: 78ea3fe8-71c2-4f5c-9b44-9c02f5563c6f
+                      details:
+                        volumes:
+                        - &id003
+                          volume: &id004
+                            outline_polygon:
+                              vertices:
+                              - lat: -23.55
+                                lng: -46.64
+                              - lat: -23.55
+                                lng: -46.63
+                              - lat: -23.54
+                                lng: -46.63
+                              - lat: -23.54
+                                lng: -46.64
+                            altitude_lower:
+                              value: 0
+                              reference: W84
+                              units: M
+                            altitude_upper:
+                              value: 120
+                              reference: W84
+                              units: M
+                          time_start:
+                            value: '2026-11-05T14:00:00Z'
+                            format: RFC3339
+                          time_end:
+                            value: '2026-11-05T14:30:00Z'
+                            format: RFC3339
+                        off_nominal_volumes: []
+                        priority: 1
+                        flight_type: VLOS
+          description: Os detalhes da operational intent foram obtidos com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A entidade solicitada não foi encontrada.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+  /uss/v1/operational_intents/{entityid}/telemetry:
+    summary: >-
+      Posição detalhada de uma operational intent fora do normal.
+    parameters:
+    - name: entityid
+      description: EntityID da operational intent.
+      schema:
+        $ref: '#/components/schemas/EntityID'
+      in: path
+      required: true
+    get:
+      tags:
+      - Operational Intents
+      security:
+      - Authority:
+        - utm.conformance_monitoring_sa
+      summary: >-
+        Fornece a telemetria de uma operational intent fora do normal
+      operationId: getOperationalIntentTelemetry
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetOperationalIntentTelemetryResponse'
+              examples:
+                foraDoVolume:
+                  summary: Drone fora dos volumes (Nonconforming)
+                  value:
+                    operational_intent_id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                    telemetry: &id006
+                      time_measured:
+                        value: '2026-11-05T14:12:31Z'
+                        format: RFC3339
+                      position:
+                        longitude: -46.6305
+                        latitude: -23.5395
+                        accuracy_h: HA3m
+                        accuracy_v: VA3m
+                        extrapolated: false
+                        altitude:
+                          value: 100
+                          reference: W84
+                          units: M
+                      velocity:
+                        speed: 8.5
+                        units_speed: MetersPerSecond
+                        track: 45
+                    next_telemetry_opportunity:
+                      value: '2026-11-05T14:12:32Z'
+                      format: RFC3339
+          description: >-
+            A telemetria da operational intent foi obtida com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A entidade solicitada não foi encontrada.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            A operational intent não está em um estado que fornece telemetria.
+        '412':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Não há telemetria disponível.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+      description: |
+        **Escopo exigido no token de quem chama:** `utm.conformance_monitoring_sa`
+
+        **Quem chama:** outros SW-USS que acompanham uma operational intent em `Nonconforming` ou `Contingent`.
+
+        Devolve a posição mais recente do drone de uma operational intent em `Nonconforming` ou `Contingent`, para que os outros SW-USS acompanhem a situação.
+
+        - Responda `409` se a operational intent não estiver em `Nonconforming` ou `Contingent`, e `412` se não houver telemetria disponível.
+        - Informe em `next_telemetry_opportunity` quando deve haver uma posição nova.
+
+        No BR-UTM, a obrigatoriedade deste endpoint ainda não foi definida.
+  /uss/v1/operational_intents:
+    summary: >-
+      Detalhes de operational intents mantidos por um SW-USS.
+    post:
+      tags:
+      - Operational Intents
+      security:
+      - Authority:
+        - utm.strategic_coordination
+      summary: Recebe a notificação de mudança em uma operational intent
+      operationId: notifyOperationalIntentDetailsChanged
+      description: |
+        **Escopo exigido no token de quem chama:** `utm.strategic_coordination`
+
+        **Quem chama:** o SW-USS que criou, alterou ou removeu uma operational intent na área de uma subscription sua.
+
+        Recebe de outro SW-USS os detalhes de uma operational intent criada, alterada (inclusive de estado) ou removida em uma área coberta por uma subscription do seu SW-USS. Quem alterou a operational intent chama este endpoint em cada SW-USS listado em `subscribers` pelo DSS.
+
+        - Com `operational_intent` preenchido: use os detalhes para adaptar as suas operações afetadas e fazer a coordenação estratégica. Não é obrigatório guardá-los; o OVN atual (`operational_intent.reference.ovn`), que vai na `key`, também pode ser obtido de novo com o SW-USS que gerencia a operational intent. Se a operational intent recebida tiver prioridade maior e intersectar uma operação sua, altere a sua operação para eliminar a interseção ou encerre-a. Se ela estiver `Activated`, o prazo é de cinco minutos depois de receber esta notificação, e nesse prazo o drone também sai da interseção ou pousa.
+        - Sem `operational_intent`: a operational intent foi removida.
+        - `subscriptions` traz o `notification_index` de cada subscription sua que motivou a notificação. Um salto no índice indica notificações perdidas; nesse caso, consulte o DSS de novo.
+        - Responda `409` se a versão recebida for menor que a de uma notificação já recebida.
+        - Responda `204` assim que receber a notificação; a avaliação do impacto nas suas operações pode vir depois.
+
+        **No sentido contrário:** depois de cada criação, mudança de estado, alteração ou remoção de uma operational intent sua no DSS, o seu SW-USS chama este endpoint em cada SW-USS listado em `subscribers`, com um token cujo `aud` é o domínio de cada um. Se um deles estiver fora do ar, não é preciso repetir a chamada nem desistir da operação: declare esse SW-USS `Down` no DSS (`PUT /dss/v1/uss_availability/{uss_id}`).
+
+        No BR-UTM, este endpoint é obrigatório.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutOperationalIntentDetailsParameters'
+            examples:
+              naoConforme:
+                summary: A empresa-a avisa que a sua operational intent passou para Nonconforming
+                value:
+                  operational_intent_id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                  operational_intent:
+                    reference:
+                      id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                      manager: empresa-a
+                      uss_availability: Unknown
+                      version: 3
+                      state: Nonconforming
+                      ovn: Y-8pfahhmSGR1Mnuv1Oc-.HOK5MhF67-v2Fo8uvev.k_
+                      time_start: *id001
+                      time_end: *id002
+                      uss_base_url: https://uss.empresa-a.com.br/utm
+                      subscription_id: 78ea3fe8-71c2-4f5c-9b44-9c02f5563c6f
+                    details:
+                      volumes:
+                      - *id003
+                      off_nominal_volumes:
+                      - volume:
+                          outline_circle:
+                            center:
+                              lat: -23.545
+                              lng: -46.635
+                            radius:
+                              value: 1500
+                              units: M
+                          altitude_lower:
+                            value: 0
+                            reference: W84
+                            units: M
+                          altitude_upper:
+                            value: 200
+                            reference: W84
+                            units: M
+                        time_start:
+                          value: '2026-11-05T14:12:30Z'
+                          format: RFC3339
+                        time_end:
+                          value: '2026-11-05T14:30:00Z'
+                          format: RFC3339
+                      priority: 1
+                      flight_type: VLOS
+                  subscriptions:
+                  - subscription_id: 0b6d2c4e-8f1a-4e3b-a5c7-9d1f3e5b7a29
+                    notification_index: 9
+              removida:
+                summary: A empresa-a avisa que a sua operational intent foi removida
+                value:
+                  operational_intent_id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                  subscriptions:
+                  - subscription_id: 0b6d2c4e-8f1a-4e3b-a5c7-9d1f3e5b7a29
+                    notification_index: 10
+        required: true
+      responses:
+        '204':
+          description: >-
+            As informações completas, novas ou atualizadas, da operational intent foram recebidas com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros estão ausentes ou inválidos.
+            * Não foi possível interpretar a entidade, ou ela contém dados inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+            * O cliente identificado no token de acesso não é o `manager` desta entidade, segundo os registros de quem recebe.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            A versão da entidade nesta mensagem é menor que a de uma notificação já recebida, ou igual à de uma notificação já recebida mas com a entidade diferente.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+
+  #
+  # USS endpoints for constraints
+  #
+  /uss/v1/constraints:
+    summary: Notificações de mudança em constraints, recebidas pelo SW-USS.
+    post:
+      tags:
+      - Constraints
+      security:
+      - Authority:
+        - utm.constraint_management
+      summary: Recebe a notificação de mudança em uma constraint
+      operationId: notifyConstraintDetailsChanged
+      description: |
+        **Escopo exigido no token de quem chama:** `utm.constraint_management`
+
+        **Quem chama:** o SW-USS Gerenciador de Constraints (na Fase 1, o DECEA).
+
+        Recebe os detalhes de uma constraint criada, alterada ou removida em uma área coberta por uma subscription do seu SW-USS com `notify_for_constraints: true`.
+
+        - Com `constraint` preenchido: use os detalhes para adaptar as suas operações afetadas. Não é obrigatório guardá-los; o OVN atual (`constraint.reference.ovn`), que vai na `key`, também pode ser obtido de novo com o Gerenciador de Constraints.
+        - Sem `constraint`: a constraint foi removida.
+        - Verifique se a constraint intersecta alguma das suas operational intents: uma operational intent que intersecta uma constraint não pode ser ativada, e uma operação afetada é alterada para eliminar a interseção ou encerrada. Se a operação estiver `Activated`, o prazo é de cinco minutos depois de receber esta notificação, mesmo que a constraint só comece depois, e nesse prazo o drone também sai da interseção ou pousa.
+
+        No BR-UTM, este endpoint é obrigatório.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutConstraintDetailsParameters'
+            examples:
+              novaConstraint:
+                summary: O DECEA avisa de uma constraint nova na área
+                value:
+                  constraint_id: c3a1e7d2-5f4b-4a8e-b9d0-6e2f1a3c7b54
+                  constraint:
+                    reference:
+                      id: c3a1e7d2-5f4b-4a8e-b9d0-6e2f1a3c7b54
+                      manager: decea
+                      uss_availability: Normal
+                      version: 1
+                      ovn: xrjOayrr64dKAR6MZR2rVUOpqC8FsDntbACrOOMCgjw_
+                      time_start:
+                        value: '2026-11-05T00:00:00Z'
+                        format: RFC3339
+                      time_end:
+                        value: '2026-11-06T00:00:00Z'
+                        format: RFC3339
+                      uss_base_url: https://gerenciador-a.exemplo.br/utm
+                    details:
+                      volumes:
+                      - volume: *id004
+                        time_start:
+                          value: '2026-11-05T00:00:00Z'
+                          format: RFC3339
+                        time_end:
+                          value: '2026-11-06T00:00:00Z'
+                          format: RFC3339
+                  subscriptions:
+                  - subscription_id: 78ea3fe8-71c2-4f5c-9b44-9c02f5563c6f
+                    notification_index: 3
+        required: true
+      responses:
+        '204':
+          description: >-
+            As informações completas, novas ou atualizadas, da constraint foram recebidas com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros estão ausentes ou inválidos.
+            * Não foi possível interpretar a entidade, ou ela contém dados inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+            * O cliente identificado no token de acesso não é o `manager` desta entidade, segundo os registros de quem recebe.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            A versão da entidade nesta mensagem é menor que a de uma notificação já recebida, ou igual à de uma notificação já recebida mas com a entidade diferente.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+
+  #
+  # USS endpoints for reports
+  #
+  /uss/v1/reports:
+    summary: Relatos de problemas de comunicação com um SW-USS.
+    post:
+      tags:
+      - Reports
+      security:
+      - Authority:
+        - utm.strategic_coordination
+      - Authority:
+        - utm.constraint_processing
+      - Authority:
+        - utm.constraint_management
+      - Authority:
+        - utm.conformance_monitoring_sa
+      - Authority:
+        - utm.availability_arbitration
+      summary: >-
+        Recebe o relato de um problema
+      operationId: makeUssReport
+      description: |
+        **Escopos aceitos no token de quem chama** (qualquer uma das opções): `utm.strategic_coordination` ou `utm.constraint_processing` ou `utm.constraint_management` ou `utm.conformance_monitoring_sa` ou `utm.availability_arbitration`
+
+        **Quem chama:** outros participantes do ECO-UTM.
+
+        Recebe de outro participante o relato de um problema (por exemplo, um erro de comunicação) relacionado a operational intents ou constraints, que o seu SW-USS talvez não tenha percebido. Responda `201` com o relato e um `report_id` atribuído pelo seu SW-USS.
+
+        No BR-UTM, este endpoint é obrigatório.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorReport'
+            examples:
+              semResposta:
+                summary: Relato de uma notificação que ficou sem resposta
+                value:
+                  exchange: &id005
+                    url: https://uss.empresa-b.com.br/utm/uss/v1/operational_intents
+                    method: POST
+                    headers:
+                    - 'Authorization: Bearer <token>'
+                    - 'Content-Type: application/json'
+                    recorder_role: Client
+                    request_time:
+                      value: '2026-11-05T13:42:08Z'
+                      format: RFC3339
+                    request_body: eyJvcGVyYXRpb25hbF9pbnRlbnRfaWQiOiIyZjgzNDNiZSJ9
+                    response_time:
+                      value: '2026-11-05T13:42:18Z'
+                      format: RFC3339
+                    response_code: 0
+                    problem: Sem resposta em 10 segundos
+        required: true
+      responses:
+        '201':
+          description: O relato foi recebido e arquivado com sucesso.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorReport'
+              examples:
+                arquivado:
+                  summary: Relato arquivado, com o report_id atribuído
+                  value:
+                    report_id: e9b1c3d5-7f2a-4b6c-8d0e-2a4c6e8f0b1d
+                    exchange: *id005
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros estão ausentes ou inválidos.
+            * Não foi possível interpretar o relato, ou ele contém dados não reconhecidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+
+  #
+  #
+  /uss/v1/log_sets:
+    summary: Log sets do SW-USS.
+    get:
+      tags:
+      - Logs
+      summary: Lista os log sets do SW-USS
+      operationId: listLogSets
+      description: |
+        **Escopo exigido no token de quem chama:** `utm.aviation_authority`
+
+        **Quem chama:** o DECEA.
+
+        Lista os log sets que o SW-USS ainda guarda, para que o DECEA encontre os logs de uma operação ou de uma ocorrência e depois os obtenha em `GET /uss/v1/log_sets/{log_set_id}`.
+
+        - Log sets de operação (`type: operational_intent`): um por operational intent, com `log_set_id` igual ao `entityid` dela.
+        - Log sets de ocorrência (`type: ocorrencia`): um por ocorrência da ICA 100-48 (Art. 40), com `log_set_id` igual a um UUIDv4 gerado pelo SW-USS quando detecta a ocorrência.
+
+        Todos os filtros são opcionais e se combinam: `time_start` e `time_end` devolvem os log sets cujo período se sobrepõe ao pedido; `type` e `operational_intent_id` restringem o tipo e a operação. Sem filtros, o SW-USS devolve todos os log sets que ainda guarda.
+      parameters:
+      - name: time_start
+        in: query
+        required: false
+        description: Devolve só os log sets cujo período termina depois deste instante. RFC 3339, fuso 'Z'.
+        schema:
+          type: string
+          format: date-time
+        example: '2026-11-05T00:00:00Z'
+      - name: time_end
+        in: query
+        required: false
+        description: Devolve só os log sets cujo período começa antes deste instante. RFC 3339, fuso 'Z'.
+        schema:
+          type: string
+          format: date-time
+        example: '2026-11-06T00:00:00Z'
+      - name: type
+        in: query
+        required: false
+        description: Devolve só os log sets deste tipo.
+        schema:
+          $ref: '#/components/schemas/LogSetType'
+        example: ocorrencia
+      - name: operational_intent_id
+        in: query
+        required: false
+        description: Devolve só os log sets que se referem a esta operational intent.
+        schema:
+          $ref: '#/components/schemas/EntityID'
+        example: 2f8343be-6482-4d1b-a474-16847e01af1e
+      responses:
+        '200':
+          description: Os log sets foram obtidos com sucesso.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListLogSetsResponse'
+              examples:
+                doisLogSets:
+                  summary: Um log set de operação e um de ocorrência
+                  value:
+                    log_sets:
+                    - log_set_id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                      type: operational_intent
+                      operational_intent_ids:
+                      - 2f8343be-6482-4d1b-a474-16847e01af1e
+                      time_start:
+                        value: '2026-11-05T13:40:00Z'
+                        format: RFC3339
+                      time_end:
+                        value: '2026-11-05T14:31:00Z'
+                        format: RFC3339
+                      description: Operação de inspeção de telhado, do planejamento ao encerramento.
+                    - log_set_id: 9c1e4b7a-3d2f-4e8b-a6c1-5f7d9b2e4a10
+                      type: ocorrencia
+                      ocorrencia: extrapolar_volume_operacional
+                      operational_intent_ids:
+                      - 2f8343be-6482-4d1b-a474-16847e01af1e
+                      time_start:
+                        value: '2026-11-05T14:12:30Z'
+                        format: RFC3339
+                      time_end:
+                        value: '2026-11-05T14:12:55Z'
+                        format: RFC3339
+                      description: O drone saiu dos volumes planejados por 25 segundos e voltou.
+        '400':
+          description: Um ou mais parâmetros estão inválidos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security: &id007
+      - Authority:
+        - utm.aviation_authority
+  /uss/v1/log_sets/{log_set_id}:
+    summary: Um log set do SW-USS.
+    parameters:
+    - name: log_set_id
+      description: >-
+        ID do log set, obtido em `GET /uss/v1/log_sets`: o `entityid` da operational intent, nos log sets de operação, ou o UUIDv4 gerado pelo SW-USS, nos de ocorrência.
+      schema:
+        type: string
+      in: path
+      required: true
+      example: 2f8343be-6482-4d1b-a474-16847e01af1e
+    get:
+      tags:
+      - Logs
+      summary: Obtém os logs de um log set
+      operationId: getLogSet
+      description: |
+        **Escopo exigido no token de quem chama:** `utm.aviation_authority`
+
+        **Quem chama:** o DECEA.
+
+        Devolve os logs de um log set, no formato comum de exportação da ASTM F3548-21 (Anexo A3). São os logs do sistema inteiro (todas as partes e domínios do SW-USS) ligados ao log set:
+
+        - `messages`: mensagens trocadas com qualquer participante do ECO-UTM, nos dois sentidos, inclusive as que ficaram sem resposta;
+        - `operator_notifications` e `operator_inputs`: avisos dados ao operador e entradas dele;
+        - `operator_associations`: qual operador é responsável por cada operational intent;
+        - `planning_attempts`: tentativas de planejamento negadas por conflito;
+        - `operational_intent_positions`: posições do drone usadas no monitoramento de conformidade.
+
+        Todos os horários ficam em UTC, sem ajuste local, e correspondem ao momento do evento. Responda `404` se o log set não existir ou não estiver mais guardado.
+      responses:
+        '200':
+          description: Os logs foram obtidos com sucesso.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/USSLogSet'
+              examples:
+                operacao:
+                  summary: Logs de uma operação (resumidos)
+                  value:
+                    messages:
+                    - url: http://api.sandbox.brutm.icea.decea.mil.br/dss/v1/operational_intent_references/2f8343be-6482-4d1b-a474-16847e01af1e
+                      method: PUT
+                      headers:
+                      - 'Authorization: Bearer <token>'
+                      - 'Content-Type: application/json'
+                      recorder_role: Client
+                      request_time:
+                        value: '2026-11-05T13:42:07Z'
+                        format: RFC3339
+                      request_body: eyJleHRlbnRzIjpbLi4uXSwic3RhdGUiOiJBY2NlcHRlZCJ9
+                      response_time:
+                        value: '2026-11-05T13:42:07Z'
+                        format: RFC3339
+                      response_body: eyJvcGVyYXRpb25hbF9pbnRlbnRfcmVmZXJlbmNlIjp7Li4ufX0=
+                      response_code: 201
+                    - url: https://uss.empresa-b.com.br/utm/uss/v1/operational_intents
+                      method: POST
+                      headers:
+                      - 'Authorization: Bearer <token>'
+                      - 'Content-Type: application/json'
+                      recorder_role: Client
+                      request_time:
+                        value: '2026-11-05T13:42:08Z'
+                        format: RFC3339
+                      request_body: eyJvcGVyYXRpb25hbF9pbnRlbnRfaWQiOiIyZjgzNDNiZSJ9
+                      response_time:
+                        value: '2026-11-05T13:42:08Z'
+                        format: RFC3339
+                      response_code: 204
+                    - url: https://uss.empresa-a.com.br/utm/uss/v1/operational_intents/2f8343be-6482-4d1b-a474-16847e01af1e
+                      method: GET
+                      headers:
+                      - 'Authorization: Bearer <token>'
+                      recorder_role: Server
+                      request_time:
+                        value: '2026-11-05T13:50:12Z'
+                        format: RFC3339
+                      response_time:
+                        value: '2026-11-05T13:50:12Z'
+                        format: RFC3339
+                      response_body: eyJvcGVyYXRpb25hbF9pbnRlbnQiOnsuLi59fQ==
+                      response_code: 200
+                    operator_notifications:
+                    - triggering_event_time:
+                        value: '2026-11-05T14:12:30Z'
+                        format: RFC3339
+                      notification_time:
+                        value: '2026-11-05T14:12:31Z'
+                        format: RFC3339
+                      notification_details: Operador avisado de que o drone saiu dos volumes planejados
+                      notification_triggering_event: CMSA0115
+                    operator_inputs:
+                    - triggering_event_time:
+                        value: '2026-11-05T13:40:00Z'
+                        format: RFC3339
+                      operational_intent_id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                      input_triggering_event: CMSA0100
+                      input_details: Operador informou frequência de envio de posição de 1 segundo
+                    operator_associations:
+                    - operational_intent_id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                      operator_id: HUKMBB
+                    planning_attempts:
+                    - time:
+                        value: '2026-11-05T13:42:05Z'
+                        format: RFC3339
+                      ovns:
+                      - xrjOayrr64dKAR6MZR2rVUOpqC8FsDntbACrOOMCgjw_
+                      missing_operational_intents:
+                      - 8a4c2f9e-3b7d-4e1a-9c6f-0d2e5b8a7c31
+                      operational_intent_id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                      problem: 'O DSS respondeu 409: faltou o OVN da operational intent da empresa-b na key'
+                    operational_intent_positions:
+                    - operational_intent_id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                      positions:
+                      - time_received:
+                          value: '2026-11-05T14:12:31Z'
+                          format: RFC3339
+                        telemetry: *id006
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: O log set não existe ou não está mais guardado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+      security: *id007
+  /uss/flights:
+    summary: Informações básicas das operações, para atender aos requisitos do Remote ID.
+    description: Este endpoint pode ser consultado repetidamente (polling) por Display Providers do Remote ID para exibir, em tempo real, a atividade das aeronaves perto de um usuário.
+    parameters:
+    - name: view
+      description: 'Área da visualização: `lat1,lng1,lat2,lng2`. O tamanho não pode passar de um comprimento de diagonal definido na norma. A visualização é o menor retângulo delimitado pelos dois cantos informados.'
+      schema:
+        type: string
+        example: -23.56,-46.65,-23.53,-46.62
+      in: query
+      required: true
+    - name: recent_positions_duration
+      description: |
+        Se maior que zero, inclua pelo menos as posições recentes dos últimos segundos informados. Caso contrário, não inclua posições recentes.
+
+        Em geral, a primeira consulta de um Display Provider para uma visualização pede todas as posições recentes, e as consultas seguintes para a mesma visualização não precisam pedi-las.
+      schema:
+        type: number
+        format: float
+        minimum: 0
+        maximum: 60
+      example: 60
+      in: query
+    get:
+      tags:
+      - Remote ID (Service Provider)
+      operationId: searchFlights
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetFlightsResponse'
+              examples:
+                umVoo:
+                  summary: Um voo ativo na área, com uma posição recente
+                  value:
+                    timestamp:
+                      value: '2026-11-05T14:05:12Z'
+                      format: RFC3339
+                    flights:
+                    - id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                      aircraft_type: Helicopter
+                      current_state:
+                        timestamp:
+                          value: '2026-11-05T14:05:11Z'
+                          format: RFC3339
+                        timestamp_accuracy: 0.1
+                        operational_status: Airborne
+                        position:
+                          lat: -23.5452
+                          lng: -46.6351
+                          alt: 100
+                          accuracy_h: HA3m
+                          accuracy_v: VA3m
+                          extrapolated: false
+                          height: &id008
+                            distance: 60
+                            reference: TakeoffLocation
+                        track: 45
+                        speed: 8.5
+                        speed_accuracy: SA1mps
+                        vertical_speed: 0
+                      simulated: false
+                      recent_positions:
+                      - time:
+                          value: '2026-11-05T14:05:01Z'
+                          format: RFC3339
+                        position:
+                          lat: -23.5458
+                          lng: -46.6358
+                          alt: 100
+                          accuracy_h: HA3m
+                          accuracy_v: VA3m
+                          extrapolated: false
+                          height: *id008
+                    no_isas_present: false
+          description: As informações dos voos foram obtidas com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        413:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O retângulo de visualização pedido é grande demais.
+      security:
+      - Authority:
+        - rid.display_provider
+      summary: Fornece os voos de uma área (Remote ID)
+      description: |
+        **Escopo exigido no token de quem chama:** `rid.display_provider`
+
+        **Quem chama:** o DECEA e os Display Providers (outros SW-USS que exibem tráfego).
+
+        Devolve os voos do seu SW-USS que estiveram dentro de `view`, para quem exibe o tráfego: o DECEA e os Display Providers. Eles consultam este endpoint repetidamente (polling); o seu SW-USS não envia telemetria ativamente.
+
+        - `view` é um retângulo dado por dois cantos: `lat1,lng1,lat2,lng2`. Responda `413` se ele for grande demais.
+        - Devolva todos os voos com posições recentes dentro da `view` no intervalo de tempo pedido.
+        - Mantenha `current_state` atualizado no mínimo a cada 10 segundos.
+        - Se `recent_positions_duration` for maior que zero, inclua as posições desse período em `recent_positions`.
+        - Se a `view` estiver inteiramente fora das suas ISAs, responda com `no_isas_present: true`.
+        - O `id` de cada voo deve ser o mesmo ID da operational intent reference do voo.
+
+        No BR-UTM, este endpoint é obrigatório: todo SW-USS envia a telemetria dos seus drones em operações ativas.
+  /uss/flights/{id}/details:
+    summary: Um voo do Remote ID informado por um Service Provider.
+    parameters:
+    - name: id
+      description: ID do voo no Remote ID; pode ser obtido na consulta geral `/flights`.
+      schema:
+        $ref: '#/components/schemas/RIDFlightID'
+      in: path
+      required: true
+    get:
+      tags:
+      - Remote ID (Service Provider)
+      operationId: getFlightDetails
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetFlightDetailsResponse'
+              examples:
+                detalhes:
+                  summary: Identificação do voo
+                  value:
+                    details:
+                      id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                      uas_id:
+                        registration_id: PP-999999999
+                      operator_id: '000.000.000-00'
+                      operator_location:
+                        lat: -23.5461
+                        lng: -46.6372
+                      operation_description: Inspeção de telhado com drone multirrotor.
+          description: Os detalhes do voo foram obtidos com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        404:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O voo pedido não foi encontrado.
+      security:
+      - Authority:
+        - rid.display_provider
+      summary: Fornece os detalhes de um voo (Remote ID)
+      description: |
+        **Escopo exigido no token de quem chama:** `rid.display_provider`
+
+        **Quem chama:** o DECEA e os Display Providers (outros SW-USS que exibem tráfego).
+
+        Devolve a identificação de um voo: dados da aeronave em `uas_id` (no Brasil, o código SISANT vai em `registration_id`), documento de identificação do operador em `operator_id` (CPF, RG, passaporte ou outro documento de identificação aceito no Brasil), localização do operador e descrição da operação. O `id` é o mesmo devolvido em `GET /uss/flights`. Responda `404` se o voo não existir.
+
+        No BR-UTM, este endpoint é obrigatório.
+  /uss/identification_service_areas/{id}:
+    parameters:
+    - name: id
+      description: EntityUUID da Identification Service Area.
+      schema:
+        $ref: '#/components/schemas/EntityUUID'
+      in: path
+      required: true
+    get:
+      tags:
+      - Remote ID (Service Provider)
+      operationId: getIdentificationServiceAreaDetails
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetIdentificationServiceAreaDetailsResponse'
+              examples:
+                area:
+                  summary: Área e intervalo de tempo da ISA
+                  value:
+                    extents: &id009
+                      volume:
+                        outline_polygon:
+                          vertices:
+                          - lat: -23.56
+                            lng: -46.65
+                          - lat: -23.56
+                            lng: -46.62
+                          - lat: -23.53
+                            lng: -46.62
+                          - lat: -23.53
+                            lng: -46.65
+                        altitude_lower:
+                          value: 0
+                          reference: W84
+                          units: M
+                        altitude_upper:
+                          value: 150
+                          reference: W84
+                          units: M
+                      time_start:
+                        value: '2026-11-05T13:58:00Z'
+                        format: RFC3339
+                      time_end:
+                        value: '2026-11-05T14:40:00Z'
+                        format: RFC3339
+          description: Os detalhes da Identification Service Area foram obtidos com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        404:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: A entidade solicitada não foi encontrada.
+      security:
+      - Authority:
+        - rid.display_provider
+      summary: Fornece os detalhes de uma ISA
+      description: |
+        **Escopo exigido no token de quem chama:** `rid.display_provider`
+
+        **Quem chama:** Display Providers.
+
+        Devolve os detalhes de uma Identification Service Area do seu SW-USS, inclusive a área (`extents`), que o DSS não devolve. Chamado por Display Providers.
+
+        No BR-UTM, a obrigatoriedade deste endpoint ainda não foi definida.
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutIdentificationServiceAreaNotificationParameters'
+            examples:
+              criada:
+                summary: Um Service Provider avisa de uma ISA nova
+                value:
+                  service_area:
+                    uss_base_url: https://uss.empresa-a.com.br/rid
+                    owner: empresa-a
+                    time_start:
+                      value: '2026-11-05T13:58:00Z'
+                      format: RFC3339
+                    time_end:
+                      value: '2026-11-05T14:40:00Z'
+                      format: RFC3339
+                    version: 1hp9apg58umv8
+                    id: 5e1f3a7c-9b2d-4c6e-8f0a-1d3b5c7e9f2a
+                  subscriptions:
+                  - subscription_id: 4d7e9a1c-2b3f-4a5d-8e6c-7f9b1d3a5c8e
+                    notification_index: 3
+                  extents: *id009
+              removida:
+                summary: Um Service Provider avisa que a ISA foi removida
+                value:
+                  subscriptions:
+                  - subscription_id: 4d7e9a1c-2b3f-4a5d-8e6c-7f9b1d3a5c8e
+                    notification_index: 4
+        required: true
+      tags:
+      - Remote ID (Display Provider)
+      operationId: postIdentificationServiceArea
+      responses:
+        204:
+          description: As informações da Identification Service Area foram atualizadas com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * Um ou mais parâmetros estão ausentes ou inválidos.
+            * Não foi possível interpretar as informações da Identification Service Area, ou elas contêm dados inválidos.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+            * O cliente identificado no token de acesso não é o `owner` desta entidade, segundo os registros de quem recebe.
+        409:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: A versão da entidade nesta mensagem é igual à de uma notificação já recebida, mas a entidade é diferente.
+      security:
+      - Authority:
+        - rid.service_provider
+      summary: Recebe a notificação de mudança em uma ISA
+      description: |
+        **Escopo exigido no token de quem chama:** `rid.service_provider`
+
+        **Quem chama:** o Service Provider (outro SW-USS) que criou, alterou ou removeu uma ISA na área de uma subscription sua.
+
+        Hospedado por quem consome telemetria (Display Provider) e tem subscriptions do Remote ID: recebe de um Service Provider as informações completas de uma ISA criada, alterada ou removida na área da subscription. Com `service_area` e `extents`, a ISA foi criada ou alterada; sem eles, foi removida. Use essas informações para saber onde consultar `GET /uss/flights`.
+
+        **No sentido contrário:** depois de criar, alterar ou remover uma ISA, o seu SW-USS chama este endpoint em cada `url` listada em `subscribers` pelo DSS.
+
+        No BR-UTM, receber estas notificações é opcional: consumir a telemetria de outros SW-USS é recomendado, mas não obrigatório.
+components:
+  securitySchemes:
+    Authority:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: /token
+          scopes:
+            utm.strategic_coordination: >-
+              O cliente pode executar as ações do papel Strategic Coordination, incluindo a detecção estratégica de conflitos.
+            utm.conformance_monitoring_sa: >-
+              O cliente pode executar as ações do papel Conformance Monitoring for Situational Awareness (CMSA).
+            utm.aviation_authority: >-
+              O cliente é uma autoridade de aviação.
+            utm.constraint_management: >-
+              O cliente pode gerenciar (criar, editar e remover) constraints, conforme o papel Constraint Management.
+            utm.constraint_processing: >-
+              O cliente pode ler referências de constraints no DSS e os detalhes nos SW-USS parceiros, conforme o papel Constraint Processing.
+            utm.availability_arbitration: >-
+              O cliente pode definir o estado de disponibilidade dos SW-USS no DSS.
+            rid.display_provider: O cliente pode consultar, ler ou criar subscriptions de Identification Service Areas do Remote ID. Um Display Provider deve receber este escopo quando o pedir.
+            rid.service_provider: O cliente pode criar, editar e remover Identification Service Areas do Remote ID. Um Service Provider deve receber este escopo quando o pedir.
+      description: |
+        Token de acesso JWT emitido pelo Auth Server do BR-UTM em `GET /token` (ver `token.yaml`), a partir da chave de API de quem chama. O tipo `oauth2` é usado aqui só para declarar os escopos de cada operação: o BR-UTM não usa o fluxo OAuth *client credentials*.
+
+        Quem chama envia o token no header `Authorization: Bearer <token>`. O seu SW-USS deve verificar:
+
+        * a assinatura RS256, com a chave pública publicada no JWKS do Auth Server (`GET /.well-known/jwks.json`);
+        * `iss` igual a `ICEA`;
+        * `aud` igual ao domínio em que a requisição chegou (o SW-USS pode responder em mais de um domínio);
+        * `exp` no futuro;
+        * `scope`: deve conter o escopo exigido pela operação. A claim pode ter vários escopos, separados por espaço; considere todos eles.
+
+        O `sub` do token identifica quem chama. É o mesmo valor que aparece como `manager` nas entidades que ele criou no DSS.
+  schemas:
+    FlightType:
+      description: >-
+        Tipo de voo. Valores aceitos: "VLOS", "EVLOS" ou "BVLOS".
+      maxLength: 5
+      minLength: 4
+      type: string
+      enum:
+      - VLOS
+      - EVLOS
+      - BVLOS
+    UUIDv4Format:
+      description: >-
+        Texto no formato de um UUID versão 4, conforme a RFC 4122.
+      maxLength: 36
+      minLength: 36
+      type: string
+      format: uuid
+      pattern: >-
+        ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$
+      example: 03e5572a-f733-49af-bc14-8a18bd53ee39
+    EntityID:
+      description: >-
+        Identificador de uma entidade comunicada pelo DSS, no formato UUIDv4.
+      anyOf:
+      - $ref: '#/components/schemas/UUIDv4Format'
+      example: 2f8343be-6482-4d1b-a474-16847e01af1e
+    EntityOVN:
+      title: EntityOVN
+      description: >-
+        Token associado a uma versão específica de uma entidade UTM, criado pelo DSS quando a referência da entidade é criada ou alterada, e entregue ao cliente que fez a alteração. O DSS guarda o EntityOVN de forma privada e o compara com os itens da `key` enviada nas escritas no espaço aéreo. O cliente também informa o EntityOVN sempre que transmite as informações completas da entidade (em um GET ou em uma notificação de subscription).
+      type: string
+      minLength: 16
+      maxLength: 128
+      example: 6LsTWURy3osoT7kkrJc3VuPyGbuc7TOK0l7kfkv8hYI_
+    EntityVersion:
+      title: EntityVersion
+      description: >-
+        Versão numérica da entidade, incrementada a cada alteração, mesmo que nenhum campo mude. Um SW-USS que já tem os detalhes de uma versão não precisa buscá-los de novo até a versão mudar.
+      type: integer
+      format: int32
+      example: 1
+    SubscriptionID:
+      description: >-
+        Identificador de uma subscription comunicada pelo DSS, no formato UUIDv4.
+      anyOf:
+      - $ref: '#/components/schemas/UUIDv4Format'
+      example: 78ea3fe8-71c2-4f5c-9b44-9c02f5563c6f
+    Time:
+      required:
+      - value
+      - format
+      type: object
+      properties:
+        value:
+          type: string
+          description: >-
+            Data e hora no formato RFC 3339. O fuso horário deve ser 'Z'.
+          format: date-time
+          example: '2026-11-05T14:00:00Z'
+        format:
+          type: string
+          enum:
+          - RFC3339
+    Radius:
+      required:
+      - value
+      - units
+      type: object
+      properties:
+        value:
+          format: float
+          description: >-
+            Distância a partir do centro de uma área circular, sobre o elipsoide WGS84.
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+          example: 300
+        units:
+          type: string
+          description: >-
+            Unidades compatíveis com FIXM. No UTM, só metros ("M") são aceitos.
+          enum:
+          - M
+    Altitude:
+      type: object
+      required:
+      - value
+      - reference
+      - units
+      properties:
+        value:
+          description: >-
+            Valor numérico da altitude. Os valores mínimo e máximo servem como verificação de sanidade e podem ser revistos à medida que novas unidades ou referenciais forem permitidos.
+          type: number
+          format: double
+          minimum: -8000
+          exclusiveMinimum: false
+          maximum: 100000
+          exclusiveMaximum: false
+          example: 120
+        reference:
+          description: >-
+            Código do referencial da distância vertical. Ver AIXM 5.1 e FIXM 4.2.0. Hoje o UTM só aceita WGS84, sem planos imediatos de aceitar outros. FIXM e AIXM aceitam 'SFC', equivalente a AGL.
+          type: string
+          enum:
+          - W84
+        units:
+          description: >-
+            Unidade usada para expressar a altitude. Ver FIXM 4.2. Hoje o UTM só aceita metros, sem planos imediatos de aceitar outras.
+          type: string
+          enum:
+          - M
+    Latitude:
+      description: >-
+        Graus de latitude ao norte do equador, em relação ao elipsoide WGS84.
+      maximum: 90
+      exclusiveMaximum: false
+      minimum: -90
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: -23.5505
+    Longitude:
+      description: >-
+        Graus de longitude a leste do meridiano de Greenwich, em relação ao elipsoide WGS84.
+      minimum: -180
+      exclusiveMaximum: false
+      maximum: 180
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: -46.6333
+    Polygon:
+      description: >-
+        Área fechada sobre a Terra. As arestas do polígono são os caminhos mais curtos entre vértices consecutivos. Isso significa, por exemplo, que a aresta entre dois pontos de mesma latitude em geral não fica sobre essa latitude. A ordem dos vértices deve ser interpretada como a que produz a menor área. As arestas não podem se cruzar e os vértices não podem se repetir; em particular, o último vértice não pode ser igual ao primeiro.
+      required:
+      - vertices
+      type: object
+      properties:
+        vertices:
+          minItems: 3
+          type: array
+          items:
+            $ref: '#/components/schemas/LatLngPoint'
+    LatLngPoint:
+      description: Ponto na superfície da Terra.
+      required:
+      - lat
+      - lng
+      type: object
+      properties:
+        lng:
+          $ref: '#/components/schemas/Longitude'
+        lat:
+          $ref: '#/components/schemas/Latitude'
+    Circle:
+      description: Área circular na superfície da Terra.
+      type: object
+      properties:
+        center:
+          $ref: '#/components/schemas/LatLngPoint'
+        radius:
+          $ref: '#/components/schemas/Radius'
+    Volume3D:
+      description: >-
+        Volume geográfico tridimensional formado pela extrusão vertical de uma forma. Deve ser informado exatamente um contorno.
+      type: object
+      properties:
+        outline_circle:
+          anyOf:
+          - $ref: '#/components/schemas/Circle'
+          description: Forma geográfica circular na superfície da Terra.
+        outline_polygon:
+          anyOf:
+          - $ref: '#/components/schemas/Polygon'
+          description: >-
+            Forma geográfica poligonal na superfície da Terra.
+        altitude_lower:
+          description: >-
+            Altitude mínima do volume. Se informada, deve ser menor que `altitude_upper`.
+          anyOf:
+          - $ref: '#/components/schemas/Altitude'
+        altitude_upper:
+          description: >-
+            Altitude máxima do volume. Se informada, deve ser maior que `altitude_lower`.
+          anyOf:
+          - $ref: '#/components/schemas/Altitude'
+    Volume4D:
+      description: Bloco contínuo de espaço-tempo geográfico.
+      required:
+      - volume
+      type: object
+      properties:
+        volume:
+          $ref: '#/components/schemas/Volume3D'
+        time_start:
+          description: Início do volume. Deve ser anterior a `time_end`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: Fim do volume. Deve ser posterior a `time_start`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+    ErrorResponse:
+      description: >-
+        Texto legível devolvido quando uma transação entre SW-USS e DSS resulta em erro.
+      type: object
+      properties:
+        message:
+          description: >-
+            Mensagem legível que indica o erro e/ou o motivo.
+          type: string
+          example: Operational intent 2f8343be-6482-4d1b-a474-16847e01af1e not found
+    SubscriptionState:
+      description: >-
+        Estado da subscription que motivou o envio de uma notificação.
+      required:
+      - subscription_id
+      - notification_index
+      type: object
+      properties:
+        subscription_id:
+          $ref: '#/components/schemas/SubscriptionID'
+        notification_index:
+          $ref: '#/components/schemas/SubscriptionNotificationIndex'
+    SubscriptionNotificationIndex:
+      format: int32
+      description: >-
+        Contador das notificações enviadas para uma subscription, para que o subscriber perceba com mais facilidade notificações perdidas.
+      type: integer
+      minimum: 0
+      exclusiveMinimum: false
+      default: 0
+    UssBaseURL:
+      description: >-
+        URL base da implementação, no SW-USS, de parte ou de toda a API entre SW-USS. A URL completa de um recurso é montada acrescentando, por exemplo, `/uss/v1/{resource}/{id}` a esta URL base. Por isso, ela não pode terminar com '/'. O host é um domínio, não um endereço IP, porque o `intended_audience` dos tokens para este SW-USS é esse domínio, sem a porta.
+      type: string
+      example: https://uss.empresa-a.com.br/utm
+    OperationalIntentState:
+      description: |
+        Estado de uma operational intent.
+        'Accepted': a operational intent foi criada e compartilhada, mas ainda não está em uso (detalhes na norma).
+        A requisição de criação ou atualização desta operational intent reference deve incluir uma `key` com os OVNs de todas as entidades relevantes.
+        'Activated': a operational intent está em uso (detalhes na norma).
+        A requisição de criação ou atualização desta operational intent reference deve incluir uma `key` com os OVNs de todas as entidades relevantes.
+        'Nonconforming': a UA está temporariamente fora dos seus volumes, mas espera-se que a situação seja recuperável (detalhes na norma).
+        Neste estado, o endpoint `/uss/v1/operational_intents/{entityid}/telemetry` da API entre SW-USS deve responder, se disponível, às consultas dos demais SW-USS. A requisição de criação ou atualização pode omitir a `key`, porque a operational intent está sendo ajustada ao voo realizado e não necessariamente consegue ser desconflitada.
+        'Contingent': considera-se que a UA não consegue mais, de forma irrecuperável, cumprir a sua operational intent (detalhes na norma).
+        Neste estado, o endpoint `/uss/v1/operational_intents/{entityid}/telemetry` da API entre SW-USS deve responder, se disponível, às consultas dos demais SW-USS. A requisição de criação ou atualização pode omitir a `key`, porque a operational intent está sendo ajustada ao voo realizado e não necessariamente consegue ser desconflitada.
+      type: string
+      enum:
+      - Accepted
+      - Activated
+      - Nonconforming
+      - Contingent
+    OperationalIntentReference:
+      description: >-
+        Informações gerais de uma operational intent planejada ou ativa, com a URL do SW-USS em que os detalhes podem ser consultados. Observação: o `ovn` só é devolvido ao SW-USS que criou a operational intent, NUNCA aos demais (para eles, o DSS do BR-UTM devolve o texto `Available from USS`).
+      required:
+      - id
+      - manager
+      - uss_availability
+      - version
+      - state
+      - time_start
+      - time_end
+      - uss_base_url
+      - subscription_id
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/EntityID'
+        manager:
+          type: string
+          example: empresa-a
+          description: >-
+            Preenchido pelo DSS com o ID do cliente que criou a entidade (o `sub` do token de acesso). Usado pelo DSS para restringir alterações e remoções ao `manager`, e pelos SW-USS para rejeitar notificações de operational intent enviadas por um SW-USS que não a gerencia.
+        uss_availability:
+          $ref: '#/components/schemas/UssAvailabilityState'
+        version:
+          $ref: '#/components/schemas/EntityVersion'
+        state:
+          $ref: '#/components/schemas/OperationalIntentState'
+        ovn:
+          description: >-
+            OVN desta operational intent. Só é preenchido quando a OperationalIntentReference é gerenciada pelo SW-USS que a consulta ou a fornece. Caso contrário, o SW-USS deve obter o OVN nos detalhes fornecidos pelo SW-USS que a gerencia.
+          anyOf:
+          - $ref: '#/components/schemas/EntityOVN'
+        time_start:
+          description: Início da operational intent.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: Fim da operational intent.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        uss_base_url:
+          $ref: '#/components/schemas/OperationalIntentUssBaseURL'
+        subscription_id:
+          description: >-
+            ID da subscription que garante que o `manager` da operational intent receba as atualizações relevantes do espaço aéreo.
+          anyOf:
+          - $ref: '#/components/schemas/SubscriptionID'
+    OperationalIntentUssBaseURL:
+      description: >-
+        URL base da implementação, no SW-USS, das partes da API entre SW-USS necessárias para fornecer os detalhes desta operational intent e, se for o caso, a telemetria em não conformidade ou contingência.
+      anyOf:
+      - $ref: '#/components/schemas/UssBaseURL'
+    ConstraintReference:
+      description: >-
+        Uma ConstraintReference (área em que existe uma constraint, com outras informações gerais, mas sem os detalhes). O DSS informa apenas estas referências; os clientes trocam os detalhes e as informações adicionais diretamente entre si (peer-to-peer).
+      required:
+      - id
+      - manager
+      - uss_availability
+      - version
+      - time_start
+      - time_end
+      - uss_base_url
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/EntityID'
+        manager:
+          type: string
+          example: decea
+          description: >-
+            Preenchido pelo DSS com o ID do cliente que criou a entidade (o `sub` do token de acesso). Usado pelo DSS para restringir alterações e remoções ao `manager`, e pelos SW-USS para rejeitar notificações de constraint enviadas por um SW-USS que não a gerencia.
+        uss_availability:
+          $ref: '#/components/schemas/UssAvailabilityState'
+        version:
+          $ref: '#/components/schemas/EntityVersion'
+        ovn:
+          description: >-
+            OVN desta constraint. Só é preenchido quando a ConstraintReference é gerenciada pelo SW-USS que a consulta ou a fornece. Caso contrário, o SW-USS deve obter o OVN nos detalhes fornecidos pelo SW-USS que a gerencia.
+          anyOf:
+          - $ref: '#/components/schemas/EntityOVN'
+        time_start:
+          $ref: '#/components/schemas/Time'
+        time_end:
+          $ref: '#/components/schemas/Time'
+        uss_base_url:
+          $ref: '#/components/schemas/ConstraintUssBaseURL'
+    ConstraintUssBaseURL:
+      description: >-
+        URL base da implementação, no SW-USS, das partes da API entre SW-USS necessárias para fornecer os detalhes desta constraint.
+      anyOf:
+      - $ref: '#/components/schemas/UssBaseURL'
+    OperationalIntentDetails:
+      description: >-
+        Detalhes de uma operational intent. Estes dados não ficam no DSS, só nos SW-USS.
+      type: object
+      properties:
+        volumes:
+          description: |
+            Volumes que contêm toda a operational intent, tão pequenos quanto possível.
+            Início e fim, e altitudes mínima e máxima, são obrigatórios em cada volume. O fim não pode estar no passado.
+            Obrigatório, com pelo menos um item, quando a operational intent está em `Accepted`, `Activated` ou `Nonconforming`.
+            Deve estar vazio quando a operational intent está em `Contingent`.
+          type: array
+          items:
+            $ref: '#/components/schemas/Volume4D'
+          default: []
+        off_nominal_volumes:
+          description: |
+            Volumes que contêm a área prevista de não conformidade enquanto a aeronave está em `Nonconforming` ou `Contingent`. O tamanho fica a critério do SW-USS.
+            Início e fim, e altitudes mínima e máxima, são obrigatórios em cada volume. O fim não pode estar no passado.
+            Obrigatório, com pelo menos um item, quando a operational intent está em `Nonconforming` ou `Contingent`.
+            Deve estar vazio quando a operational intent está em `Accepted` ou `Activated`.
+          type: array
+          items:
+            $ref: '#/components/schemas/Volume4D'
+          default: []
+        priority:
+          $ref: '#/components/schemas/Priority'
+        flight_type:
+          $ref: '#/components/schemas/OperationalIntentFlightType'
+    Priority:
+      description: |
+        Prioridade ordinal da operational intent, definida pelo regulador. Operational intents com valor menor têm prioridade menor que todas as de valor maior. Uma operational intent de prioridade menor não pode criar conflito com uma de prioridade maior; uma de prioridade maior pode criar conflito com uma de prioridade menor. O regulador define se operational intents de mesma prioridade podem conflitar.
+
+        No BR-UTM, em Zona UTM do tipo U1, crie operational intents somente com prioridade `1`. Operational intents de mesma prioridade não podem conflitar; numa disputa, vale a que foi ativada primeiro. Entre prioridades diferentes, a operational intent de prioridade maior pode ser ativada mesmo intersectando uma de prioridade menor, e o SW-USS da de prioridade menor, ao ser notificado, altera a operação para eliminar a interseção ou a encerra, em até cinco minutos depois da notificação se ela estiver `Activated` (com o drone fora da interseção ou pousado).
+      type: integer
+      default: 0
+    OperationalIntentFlightType:
+      description: >-
+        Tipo de voo da operational intent, declarado pelo operador. No BR-UTM, por enquanto, não há diferença entre voos VLOS, EVLOS e BVLOS na desconflitação: nenhuma operational intent pode intersectar outra, qualquer que seja o tipo de voo.
+      anyOf:
+      - $ref: '#/components/schemas/FlightType'
+    OperationalIntent:
+      description: Descrição completa de uma operational intent.
+      required:
+      - reference
+      - details
+      type: object
+      properties:
+        reference:
+          $ref: '#/components/schemas/OperationalIntentReference'
+        details:
+          $ref: '#/components/schemas/OperationalIntentDetails'
+    PutOperationalIntentDetailsParameters:
+      description: >-
+        Parâmetros de uma mensagem com os detalhes de uma operational intent. Enviada por um cliente (não pelo DSS) diretamente aos clientes com subscriptions, quando outro cliente altera o espaço aéreo em uma área coberta por uma subscription.
+      required:
+      - operational_intent_id
+      - subscriptions
+      type: object
+      properties:
+        operational_intent_id:
+          description: ID da operational intent que mudou.
+          anyOf:
+          - $ref: '#/components/schemas/EntityID'
+        operational_intent:
+          description: >-
+            Informações completas da operational intent que mudou. Se este campo for omitido, a operational intent foi removida. O campo `ovn` da `reference` interna deve ser preenchido.
+          anyOf:
+          - $ref: '#/components/schemas/OperationalIntent'
+        subscriptions:
+          type: array
+          description: Subscription(s) que motivaram esta notificação.
+          items:
+            $ref: '#/components/schemas/SubscriptionState'
+          minItems: 1
+    GetOperationalIntentDetailsResponse:
+      description: >-
+        Resposta a um pedido dos detalhes da operational intent com o ID informado.
+      required:
+      - operational_intent
+      type: object
+      properties:
+        operational_intent:
+          $ref: '#/components/schemas/OperationalIntent'
+    ConstraintDetails:
+      description: >-
+        Detalhes de uma constraint. Estes dados não ficam no DSS, só nos SW-USS.
+      required:
+      - volumes
+      type: object
+      properties:
+        volumes:
+          description: |
+            Volumes que contêm toda a constraint, tão pequenos quanto possível.
+            O fim não pode estar no passado.
+          minItems: 1
+          type: array
+          items:
+            $ref: '#/components/schemas/Volume4D'
+        type:
+          description: >-
+            Tipo de restrição do espaço aéreo que esta constraint representa. No BR-UTM, os valores deste campo ainda não foram definidos.
+          type: string
+        geozone:
+          description: >-
+            Se esta constraint for uma geo zone conforme a ED-269, os detalhes dessa geo zone. No BR-UTM, o DECEA ainda não usa este campo: na maioria das vezes, ele vem vazio. O campo é mantido para uso futuro.
+          anyOf:
+          - $ref: '#/components/schemas/GeoZone'
+    Constraint:
+      description: Especificação completa de uma constraint.
+      required:
+      - reference
+      - details
+      type: object
+      properties:
+        reference:
+          $ref: '#/components/schemas/ConstraintReference'
+        details:
+          $ref: '#/components/schemas/ConstraintDetails'
+    PutConstraintDetailsParameters:
+      description: >-
+        Parâmetros de uma mensagem com as informações completas, novas, de uma constraint. Enviada por um cliente (não pelo DSS) diretamente aos clientes com subscriptions, quando outro cliente altera o espaço aéreo em uma área coberta por uma subscription.
+      required:
+      - constraint_id
+      - subscriptions
+      type: object
+      properties:
+        constraint_id:
+          description: ID da constraint que mudou.
+          anyOf:
+          - $ref: '#/components/schemas/EntityID'
+        constraint:
+          description: >-
+            Informações completas da constraint que mudou. Se este campo for omitido, a constraint foi removida. O campo `ovn` da `reference` interna deve ser preenchido.
+          anyOf:
+          - $ref: '#/components/schemas/Constraint'
+        subscriptions:
+          description: Subscription(s) que motivaram esta notificação.
+          type: array
+          items:
+            $ref: '#/components/schemas/SubscriptionState'
+          minItems: 1
+    GetOperationalIntentTelemetryResponse:
+      description: >-
+        Resposta a um pedido da telemetria de uma operational intent fora do normal.
+      required:
+      - operational_intent_id
+      type: object
+      properties:
+        operational_intent_id:
+          description: >-
+            ID da operational intent que o veículo que informa a telemetria está voando.
+          anyOf:
+          - $ref: '#/components/schemas/EntityID'
+        telemetry:
+          $ref: '#/components/schemas/VehicleTelemetry'
+        next_telemetry_opportunity:
+          description: >-
+            Só se espera uma telemetria nova, semelhante a esta, a partir deste instante; em geral, quem consulta não deve chamar o endpoint de novo antes disso. Se o campo for omitido, não há previsão de nova telemetria.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+    VehicleTelemetry:
+      description: Posição, altitude e velocidade do veículo.
+      required:
+      - time_measured
+      type: object
+      properties:
+        time_measured:
+          $ref: '#/components/schemas/Time'
+        position:
+          $ref: '#/components/schemas/Position'
+        velocity:
+          $ref: '#/components/schemas/Velocity'
+    PositionAccuracyVertical:
+      description: >-
+        Erro vertical provável da posição informada. É a enumeração GVA do ADS-B, com alguns valores mais finos para UAS.
+      type: string
+      enum:
+      - VAUnknown
+      - VA150mPlus
+      - VA150m
+      - VA45m
+      - VA25m
+      - VA10m
+      - VA3m
+      - VA1m
+    PositionAccuracyHorizontal:
+      description: >-
+        Erro horizontal provável da posição informada. É a enumeração NACp do ADS-B, mais o valor de 1 m, para cobrir melhor a faixa de UAS.
+      type: string
+      enum:
+      - HAUnknown
+      - HA10NMPlus
+      - HA10NM
+      - HA4NM
+      - HA2NM
+      - HA1NM
+      - HA05NM
+      - HA03NM
+      - HA01NM
+      - HA005NM
+      - HA30m
+      - HA10m
+      - HA3m
+      - HA1m
+    Position:
+      description: >-
+        Posição do veículo (UAS) informada para o UTM. Observação: os valores de `accuracy` são obrigatórios quando `extrapolated` é verdadeiro.
+      type: object
+      properties:
+        longitude:
+          $ref: '#/components/schemas/Longitude'
+        latitude:
+          $ref: '#/components/schemas/Latitude'
+        accuracy_h:
+          $ref: '#/components/schemas/PositionAccuracyHorizontal'
+        accuracy_v:
+          $ref: '#/components/schemas/PositionAccuracyVertical'
+        extrapolated:
+          description: >-
+            Verdadeiro se esta posição foi gerada principalmente por cálculo, e não por medição direta de um instrumento.
+          type: boolean
+          default: false
+        altitude:
+          $ref: '#/components/schemas/Altitude'
+    Velocity:
+      required:
+      - speed
+      - units_speed
+      type: object
+      properties:
+        speed:
+          format: float
+          type: number
+          description: Velocidade em relação ao solo, em metros por segundo.
+          example: 8.5
+        units_speed:
+          type: string
+          enum:
+          - MetersPerSecond
+        track:
+          format: float
+          type: number
+          description: >-
+            Direção do voo, expressa como ângulo de rumo verdadeiro em relação ao solo, em graus a leste do norte, com resolução mínima de 1 grau. O valor 360 indica inválido, sem valor ou desconhecido.
+          example: 45
+          default: 0
+    UssAvailabilityState:
+      type: string
+      enum:
+      - Unknown
+      - Normal
+      - Down
+      description: |
+        Um SW-USS é considerado `Unknown` até que um SW-USS com o escopo de arbitragem de disponibilidade indique outra coisa. Quando a arbitragem determina que um SW-USS não responde adequadamente, ele passa a `Down`.
+        Um SW-USS em `Unknown` tem, no DSS, as mesmas capacidades de um SW-USS em `Normal`. No DSS do BR-UTM, um SW-USS `Down` também mantém essas capacidades: continua podendo criar, alterar e remover as próprias operational intents. O efeito de `Down` está descrito em `PUT /dss/v1/uss_availability/{uss_id}` (ver `dss.yaml`).
+    USSLogSet:
+      type: object
+      description: >-
+        Conjunto de dados de log que atende aos requisitos de registro da norma, no formato comum de exportação da ASTM F3548-21 (Anexo A3).
+      properties:
+        messages:
+          description: >-
+            Mensagens trocadas com qualquer participante do ECO-UTM (o DSS, os outros SW-USS e os demais serviços do BR-UTM), nos dois sentidos, incluindo os casos em que a resposta esperada a uma requisição não chegou.
+          type: array
+          items:
+            $ref: '#/components/schemas/ExchangeRecord'
+          default: []
+        operator_notifications:
+          description: >-
+            Notificações ao operador exigidas pela norma.
+          type: array
+          items:
+            $ref: '#/components/schemas/UserNotificationRecord'
+          default: []
+        operator_inputs:
+          description: >-
+            Entradas do operador exigidas pela norma.
+          type: array
+          items:
+            $ref: '#/components/schemas/UserInputRecord'
+          default: []
+        operator_associations:
+          description: >-
+            Para um SW-USS que gerencia operational intents: associações entre um operador e as operational intents que passaram para `Accepted`.
+          type: array
+          items:
+            $ref: '#/components/schemas/OperatorAssociation'
+          default: []
+        planning_attempts:
+          description: >-
+            Para um SW-USS que gerencia operational intents: casos em que uma operational intent não pôde ser planejada ou replanejada por conflito com outras operational intents ou constraints.
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanningRecord'
+          default: []
+        operational_intent_positions:
+          description: >-
+            Para um SW-USS que faz monitoramento de conformidade: todas as posições recebidas da UA e usadas nesse monitoramento.
+          type: array
+          items:
+            $ref: '#/components/schemas/OperationalIntentPositions'
+          default: []
+        constraint_provider_associations:
+          description: >-
+            Para um SW-USS que faz gerenciamento de constraints: associações entre um provedor de constraints autorizado e todas as constraints que passam para o estado válido.
+          type: array
+          items:
+            $ref: '#/components/schemas/ConstraintProviderAssociation'
+          default: []
+    ExchangeRecord:
+      type: object
+      description: Detalhes de uma troca de requisição e resposta.
+      required:
+      - url
+      - method
+      - recorder_role
+      - request_time
+      properties:
+        url:
+          type: string
+          description: URL completa da requisição.
+          example: https://uss.empresa-b.com.br/utm/uss/v1/operational_intents
+        method:
+          type: string
+          description: 'Verbo HTTP usado por quem fez a requisição (ex.: "PUT", "GET").'
+          example: POST
+        headers:
+          description: >-
+            Headers da requisição ou da resposta. Deve conter, no mínimo, o header `Authorization`.
+          type: array
+          items:
+            type: string
+          default: []
+          example:
+          - 'Authorization: Bearer <token>'
+          - 'Content-Type: application/json'
+        recorder_role:
+          type: string
+          description: >-
+            Código que indica o papel do SW-USS que registrou a troca: 'Client' (fez a requisição a um SW-USS remoto) ou 'Server' (atendeu a requisição de um SW-USS remoto).
+          enum:
+          - Client
+          - Server
+        request_time:
+          description: Momento em que a requisição foi enviada ou recebida.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        request_body:
+          description: Corpo da requisição enviado ou recebido, codificado em Base64.
+          type: string
+          default: ''
+        response_time:
+          description: Momento em que a resposta foi enviada ou recebida.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        response_body:
+          type: string
+          default: ''
+          description: >-
+            Corpo da resposta enviado ou recebido, codificado em Base64.
+        response_code:
+          type: integer
+          format: int32
+          default: 0
+          description: Código HTTP da resposta enviada ou recebida.
+        problem:
+          type: string
+          description: >-
+            Descrição legível do problema da troca, se houver.
+          example: Sem resposta em 10 segundos
+    ErrorReport:
+      type: object
+      description: Relato que informa um servidor sobre um problema de comunicação.
+      required:
+      - exchange
+      properties:
+        report_id:
+          type: string
+          maxLength: 128
+          description: >-
+            ID atribuído pelo servidor que recebe o relato. Não preencha ao enviar um relato.
+          example: e9b1c3d5-7f2a-4b6c-8d0e-2a4c6e8f0b1d
+        exchange:
+          anyOf:
+          - $ref: '#/components/schemas/ExchangeRecord'
+          description: >-
+            Requisição (feita por este SW-USS) e resposta associadas ao erro.
+    PositionRecord:
+      type: object
+      description: >-
+        Registro de telemetria recebida por este SW-USS (em geral, para monitoramento de conformidade).
+      required:
+      - time_received
+      - telemetry
+      properties:
+        time_received:
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+          description: Momento em que o SW-USS recebeu esta posição.
+        telemetry:
+          $ref: '#/components/schemas/VehicleTelemetry'
+    OperationalIntentPositions:
+      type: object
+      description: >-
+        Registro das posições coletadas durante uma operational intent.
+      required:
+      - operational_intent_id
+      properties:
+        positions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PositionRecord'
+          default: []
+        operational_intent_id:
+          description: ID da operational intent associada a `positions`.
+          anyOf:
+          - $ref: '#/components/schemas/EntityID'
+    PlanningRecord:
+      type: object
+      description: >-
+        Registro de uma tentativa, bem-sucedida ou não, de criar ou alterar uma operational intent.
+      required:
+      - time
+      - ovns
+      properties:
+        time:
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+          description: Momento em que este evento de planejamento ocorreu.
+        ovns:
+          description: >-
+            OVNs que o SW-USS conhecia ao planejar a operational intent.
+          type: array
+          default: []
+          items:
+            $ref: '#/components/schemas/EntityOVN'
+        missing_operational_intents:
+          description: >-
+            Operational intents que faltaram (em tentativas negadas pelo DSS com o código 409).
+          type: array
+          items:
+            $ref: '#/components/schemas/EntityID'
+          default: []
+        missing_constraints:
+          description: >-
+            Constraints que faltaram (em tentativas negadas pelo DSS com o código 409).
+          type: array
+          items:
+            $ref: '#/components/schemas/EntityID'
+          default: []
+        operational_intent_id:
+          description: ID da operational intent sendo planejada.
+          anyOf:
+          - $ref: '#/components/schemas/EntityID'
+        problem:
+          type: string
+          description: >-
+            Descrição em texto livre dos problemas encontrados nesta tentativa de planejamento.
+          example: 'O DSS respondeu 409: faltou o OVN da operational intent da empresa-b na key'
+    UserNotificationRecord:
+      type: object
+      description: Registro de notificação ao usuário.
+      required:
+      - triggering_event_time
+      - notification_time
+      - notification_triggering_event
+      properties:
+        triggering_event_time:
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+          description: Momento do evento que gerou a notificação.
+        notification_time:
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+          description: Momento em que o usuário foi notificado.
+        notification_details:
+          type: string
+          description: >-
+            Descrição das informações fornecidas ao usuário, conforme o requisito indicado em `notification_triggering_event`.
+          example: Operador avisado de que o drone saiu dos volumes planejados
+        notification_triggering_event:
+          type: string
+          description: ID do requisito a que esta notificação se refere.
+          enum:
+          - GEN0400
+          - GEN0405
+          - SCD0090
+          - SCD0095
+          - ACM0010
+          - CMSA0115
+          - CMSA0300
+          - CSTP0005
+          - CSTP0010
+          - CSTP0020
+          - CSTP0025
+          - CSTP0030
+          - CSTP0035
+    UserInputRecord:
+      type: object
+      description: Registro de entrada do usuário.
+      required:
+      - triggering_event_time
+      - operational_intent_id
+      - input_triggering_event
+      properties:
+        triggering_event_time:
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+          description: Momento em que o SW-USS recebeu a entrada do usuário.
+        operational_intent_id:
+          anyOf:
+          - $ref: '#/components/schemas/EntityID'
+          description: >-
+            ID da operational intent a que a entrada do usuário se refere.
+        input_triggering_event:
+          type: string
+          description: ID do requisito a que esta notificação se refere.
+          enum:
+          - OPIN0040
+          - CMSA0010
+          - CMSA0025
+          - CMSA0100
+          - CMSA0105
+          - CMSA0110
+          - CMSA0200
+          - CMSA0205
+          - CMSA0210
+          - CMSA0215
+        input_details:
+          type: string
+          description: >-
+            Descrição das informações fornecidas pelo usuário, conforme o requisito indicado em `input_triggering_event`.
+          example: Operador informou frequência de envio de posição de 1 segundo
+    OperatorAssociation:
+      type: object
+      description: >-
+        Associação entre uma operational intent e o seu operador.
+      required:
+      - operational_intent_id
+      - operator_id
+      properties:
+        operational_intent_id:
+          description: >-
+            ID da operational intent a que esta associação se refere.
+          anyOf:
+          - $ref: '#/components/schemas/EntityID'
+        operator_id:
+          description: >-
+            Identificador único do operador responsável pela operational intent.
+          type: string
+          example: HUKMBB
+    ConstraintProviderAssociation:
+      type: object
+      description: >-
+        Associação entre uma constraint e o provedor responsável por ela.
+      required:
+      - constraint_id
+      - constraint_provider_id
+      properties:
+        constraint_id:
+          description: ID da constraint a que esta associação se refere.
+          anyOf:
+          - $ref: '#/components/schemas/EntityID'
+        constraint_provider_id:
+          description: >-
+            Identificador único do provedor responsável pela constraint.
+          type: string
+
+    #
+    # ED-269 compliant GeoZone representation
+    #
+          example: decea
+    GeoZone:
+      type: object
+      description: >-
+        Espaço aéreo de dimensões definidas, sobre o território terrestre ou as águas territoriais de um Estado, em que se aplica uma restrição ou condição específica para voos de UAS (modelo de dados da ED-269). Ainda não é usado pelo DECEA (ver `ConstraintDetails.geozone`).
+      required:
+      - identifier
+      - country
+      - type
+      - restriction
+      - zone_authority
+      properties:
+        identifier:
+          anyOf:
+          - $ref: '#/components/schemas/CodeZoneIdentifierType'
+          description: |
+            Texto que identifica de forma única a zona de UAS dentro do Estado ou território indicado em `country`.
+            Observação: a zona de UAS é identificada de forma única no mundo pela combinação de `country` e `identifier`.
+        country:
+          anyOf:
+          - $ref: '#/components/schemas/CodeCountryISOType'
+          description: |
+            Estado que tem autoridade para declarar a zona.
+            Observação: nenhuma zona pertence a dois Estados. Não é preciso codificar que duas zonas estão "em Estados vizinhos" ou são "relacionadas".
+        zone_authority:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Authority'
+        name:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: >-
+            Nome livre pelo qual a zona é conhecida pelo público ou pela comunidade de UAS.
+        type:
+          anyOf:
+          - $ref: '#/components/schemas/CodeZoneType'
+          description: >-
+            Indica se a zona é fornecida com a definição comum ou com uma definição personalizada para um usuário específico.
+        restriction:
+          anyOf:
+          - $ref: '#/components/schemas/CodeRestrictionType'
+          description: >-
+            Indica se voar na zona é condicionado, proibido ou livre.
+        restriction_conditions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConditionExpressionType'
+          description: >-
+            Indica as condições em que a zona pode ser usada.
+        region:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 65535
+          description: |
+            Quando aplicável, identifica a região, dentro de um Estado, em que a zona de UAS fica.
+            Observação 1) identificada por um número entre 0 e 65535 (16 bits), correspondente a uma lista de regiões predefinida para cada Estado.
+            Observação 2) este atributo serve para facilitar a extração de subconjuntos de dados de regiões específicas.
+          example: 1
+        reason:
+          items:
+            $ref: '#/components/schemas/CodeZoneReasonType'
+          description: >-
+            Indicação codificada do motivo que levou à criação da zona.
+          maxItems: 9
+          type: array
+        other_reason_info:
+          type: string
+          maxLength: 30
+          description: >-
+            Descrição livre do motivo que levou à criação da zona, quando não coberto por um valor codificado.
+          example: Atividade de paraquedismo
+        regulation_exemption:
+          anyOf:
+          - $ref: '#/components/schemas/CodeYesNoType'
+          description: >-
+            Indica se a zona de UAS admite isenções da regulamentação (`YES`) ou não (`NO`). As isenções são detalhadas no campo `message`.
+        u_space_class:
+          anyOf:
+          - $ref: '#/components/schemas/CodeUSpaceClassType'
+          description: |
+            Código que identifica a categoria ou classe da zona segundo um "conceito U-space".
+            Observação: existem duas classificações (em rascunho), uma da Eurocontrol e outra do CORUS. Por isso, esperam-se duas instâncias deste atributo, uma de cada lista. Isso pode ser substituído no futuro por atributos e listas de valores separados.
+        message:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: >-
+            Mensagem a exibir ao usuário da zona, em geral na estação do piloto remoto, para informá-lo de algo específico da zona (em geral, quando não se trata só de uma restrição de voo, e portanto não só de um alerta ou de uma limitação automática; por exemplo: "captura de imagens proibida nesta zona", "ventos fortes frequentes nesta zona", "proibido pousar ou decolar nesta zona"). A mensagem também indica isenções da regulamentação na zona (ver abaixo). Várias informações podem ser agrupadas, separadas por "/".
+        additional_properties:
+          type: object
+          description: >-
+            Ponto de extensão: permite acrescentar atributos de interesse nacional.
+    CodeZoneIdentifierType:
+      type: string
+      maxLength: 7
+      description: |
+        Texto de no máximo 7 caracteres que identifica a área de forma única em um escopo geográfico.
+        OBSERVAÇÃO (1): não inclui o identificador do país, que é um atributo separado da zona de UAS.
+        OBSERVAÇÃO (2): o limite de 7 caracteres garante compatibilidade com ARINC 424 e AIXM, em que um designador de espaço aéreo tem no máximo 10 caracteres: os 10 caracteres resultam da concatenação de `country` e `identifier`.
+      example: SBMT01
+    CodeCountryISOType:
+      type: string
+      minLength: 3
+      maxLength: 3
+      description: |
+        Identificador de 3 letras de um país ou território, conforme a ISO 3166-1 alpha-3.
+        OBSERVAÇÃO: os códigos de 3 letras da ISO têm estas vantagens:
+        - distinguem territórios remotos do território continental;
+        - são únicos, ao contrário dos códigos de país da ICAO, em que um mesmo Estado pode ter dois ou mais códigos;
+        - também são usados em normas militares, como a STANAG 1059 INT da OTAN, que traz acréscimos bem documentados que podem ser úteis para áreas de UAS.
+      example: BRA
+    CodeZoneType:
+      type: string
+      description: >-
+        Indica se a zona de UAS é fornecida com a definição comum (`COMMON`) ou com uma definição personalizada para um UAS ou operador específico (`CUSTOMIZED`).
+      enum:
+      - COMMON
+      - CUSTOMIZED
+    ConditionExpressionType:
+      type: string
+      maxLength: 10000
+      description: |
+        Expressão codificada que informa o que é autorizado ou proibido em uma zona de acesso condicionado. Ao contrário do campo `message` da zona, esta expressão é feita para ser interpretada pelo UAS, enquanto `message` é interpretado pelo piloto remoto.
+        OBSERVAÇÃO: o tamanho máximo do campo é de 10.000 caracteres.
+
+        **Linguagem de definição das condições**
+
+        - Cada Estado estabelece uma lista de características relevantes (CHARTYPE) e a lista finita de valores aceitos de cada uma (CHARVAL).
+        - Cada campo CHARTYPE e CHARVAL é definido por um conjunto limitado de caracteres.
+        - Um documento público dá a definição de cada um e a referência às características legais ou técnicas envolvidas.
+        - O editor de geozones de cada Estado usa essas características, com a linguagem de condições abaixo, para definir as condições exatas de cada zona.
+        - A função de geofencing de cada UAS recebe o estado das características do UAS para o voo pretendido, para aplicar as condições, seja gerando alertas, seja limitando o voo.
+        - Se o valor de uma característica da condição não estiver definido no UAS, a função de geofencing deve avisar o piloto (alerta de geoawareness) ou, no geofencing automático, considerar a zona proibida.
+
+        Uma expressão condicional tem esta forma:
+
+        - O UAS é PERMITIDO ou (exclusivo) PROIBIDO de voar nesta zona neste momento SE (Característica1) CHARTYPE1 = (Valor1) CHARVAL1 E CHARTYPE2 = CHARVAL2 E ... Fim SE OU (...) ... Fim OU
+        - Só os campos variáveis são editados na string, separados por "/"; os demais são implícitos.
+
+        Exemplos de CHARTYPE e CHARVAL:
+
+        - CHARTYPE: tipo de operador; CHARVAL aceitos: Militar/Polícia/Bombeiros
+        - CHARTYPE: ID do operador (número de registro); CHARVAL aceitos: conforme o formato de registro
+        - CHARTYPE: tipo de operação: A1 conforme as categorias Open da EASA, S1 (cenário padrão nacional 1), STS01 (cenário padrão da categoria Specific da EASA) etc.
+        - CHARTYPE: tipo de operação UTM: Planejada/Não planejada
+        - CHARTYPE: passageiros a bordo: sim/não
+
+        Cada catálogo nacional de CHARTYPE e CHARVAL pode definir categorias complexas de operação, drone ou equipamento. Exemplo: no país A, pode haver um tipo "nível do drone" com os valores Baixo, Médio e Alto, cada um correspondendo a um conjunto definido de desempenho do UAS, características da operação, qualificação do operador etc. Isso evita codificar uma combinação complexa no banco de geozones. A expressão também pode codificar a proibição de captura de imagens em uma zona.
+
+        Exemplo: `PERMITTED/IMAGE CAPTURE=NO/NOISE CLASS=A/OR/OPERATOR=POLICE`
+
+        Significado: o voo é permitido nesta zona neste momento se nenhuma imagem for capturada (câmera removida ou desativada) e se a classe de ruído for A (segundo uma classificação conhecida), ou se o operador do UAS for a Polícia.
+      example: PERMITTED/IMAGE CAPTURE=NO
+    CodeRestrictionType:
+      type: string
+      description: |
+        Indica se voar na zona é proibido, exige autorização, é condicionado ou é livre.
+
+        - `PROHIBITED`: voar na zona é proibido.
+        - `REQ_AUTHORISATION`: voar na zona exige autorização prévia (ver `zone_authority`).
+        - `CONDITIONAL`: voar na zona é permitido nas condições de `restriction_conditions`.
+        - `NO_RESTRICTION`: não há restrição para voar na zona.
+      enum:
+      - PROHIBITED
+      - REQ_AUTHORISATION
+      - CONDITIONAL
+      - NO_RESTRICTION
+      example: PROHIBITED
+    CodeZoneReasonType:
+      type: string
+      description: >-
+        Indicação codificada do motivo que justifica a existência de uma zona de UAS.
+      enum:
+      - AIR_TRAFFIC
+      - SENSITIVE
+      - PRIVACY
+      - POPULATION
+      - NATURE
+      - NOISE
+      - FOREIGN_TERRITORY
+      - EMERGENCY
+      - OTHER
+    CodeUSpaceClassType:
+      type: string
+      maxLength: 100
+      description: |
+        Identificador codificado da categoria ou classe da zona segundo um "conceito U-space".
+        OBSERVAÇÃO: nesta versão do modelo, não há lista específica de valores. Por exemplo, os tipos de zona "X", "Y" e "Z" do projeto CORUS (SESAR JU) sobre o conceito de operação U-space poderão ser usados em uma versão futura. Até que haja uma lista definida, este tipo é tratado como texto de no máximo 100 caracteres.
+      example: X
+    CodeYesNoType:
+      type: string
+      description: >-
+        Valor codificado que indica uma escolha entre aplicável (sim) e não aplicável (não).
+      enum:
+      - YES
+      - NO
+    Authority:
+      type: object
+      description: |
+        Autoridade responsável por autorizar, ser notificada ou fornecer informações sobre operações de UAS na zona.
+        Regra: pelo menos um destes campos deve ser informado: `site_url`, `email` ou `phone`.
+      properties:
+        name:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: Nome oficial de uma autoridade pública ou privada.
+        service:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: >-
+            Nome de um departamento ou serviço específico da organização.
+        contact_name:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: >-
+            Nome ou função de uma pessoa específica a ser contatada na organização.
+        site_url:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: |
+            URL do site público pelo qual a organização pode ser contatada.
+            Observação: no formato de codificação, isso pode ser restringido para garantir uma URL válida.
+        email:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: |
+            Endereço de e-mail pelo qual a organização pode ser contatada.
+            Observação: no formato de codificação, isso pode ser restringido para garantir um e-mail válido.
+        phone:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: >-
+            Telefone pelo qual a organização pode ser contatada.
+        purpose:
+          anyOf:
+          - $ref: '#/components/schemas/CodeAuthorityRole'
+          description: Papel da autoridade em relação à zona.
+        interval_before:
+          type: string
+          format: duration
+          description: >-
+            Intervalo mínimo entre a notificação ou o pedido de autorização e o início da operação na zona, no formato PnnDTnnHnnM (ISO 8601).
+          example: PT2H
+    CodeAuthorityRole:
+      type: string
+      description: >-
+        Lista de valores codificados que indica o papel de uma autoridade em relação à zona de UAS.
+      enum:
+      - AUTHORIZATION
+      - NOTIFICATION
+      - INFORMATION
+    TextShortType:
+      type: string
+      maxLength: 200
+      description: Texto livre de no máximo 200 caracteres.
+      example: Captura de imagens proibida nesta zona
+    RidCircle:
+      description: Área circular na superfície da Terra.
+      type: object
+      properties:
+        center:
+          $ref: '#/components/schemas/RidLatLngPoint'
+        radius:
+          $ref: '#/components/schemas/Radius'
+    RidVolume3D:
+      description: >-
+        Volume geográfico tridimensional formado pela extrusão vertical de uma forma. Deve ser informado exatamente um contorno.
+      type: object
+      properties:
+        outline_circle:
+          anyOf:
+          - $ref: '#/components/schemas/RidCircle'
+          description: Forma geográfica circular na superfície da Terra.
+        outline_polygon:
+          anyOf:
+          - $ref: '#/components/schemas/RidPolygon'
+          description: >-
+            Forma geográfica poligonal na superfície da Terra.
+        altitude_lower:
+          description: >-
+            Altitude mínima do volume. Se informada, deve ser menor que `altitude_upper`.
+          anyOf:
+          - $ref: '#/components/schemas/RidAltitude'
+        altitude_upper:
+          description: >-
+            Altitude máxima do volume. Se informada, deve ser maior que `altitude_lower`.
+          anyOf:
+          - $ref: '#/components/schemas/RidAltitude'
+    RidVolume4D:
+      description: Bloco contínuo de espaço-tempo geográfico.
+      required:
+      - volume
+      type: object
+      properties:
+        volume:
+          $ref: '#/components/schemas/RidVolume3D'
+        time_start:
+          description: Início do volume. Deve ser anterior a `time_end`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: Fim do volume. Deve ser posterior a `time_start`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+    GetFlightsResponse:
+      description: Resposta de um Service Provider a uma consulta de voos em uma área de interesse.
+      required:
+      - timestamp
+      type: object
+      properties:
+        timestamp:
+          description: Momento, segundo o Service Provider, em que estas informações estavam atualizadas.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        flights:
+          description: Todos os voos que estiveram na área pedida dentro do período de retenção do Remote ID, inclusive os que não estão mais na área, mas estiveram nela dentro desse período. Aeronaves que não estão em voo, e não estiveram em voo dentro do período de retenção, não entram na lista.
+          type: array
+          items:
+            $ref: '#/components/schemas/RIDFlight'
+          default: []
+        no_isas_present:
+          type: boolean
+          default: false
+          description: A visualização pedida está inteiramente fora das áreas em que este provedor presta serviço de Remote ID (volumes das suas Identification Service Areas). Um Display Provider que recebe esta resposta deve parar de consultar este endpoint para essa visualização até que interações com o DSS indiquem o contrário.
+    RidSubscriptionNotificationIndex:
+      format: int32
+      description: Contador das notificações enviadas para uma subscription, para que o subscriber perceba com mais facilidade notificações perdidas.
+      type: integer
+      example: 3
+    RidSubscriptionState:
+      description: Estado da subscription que motivou o envio de uma notificação.
+      required:
+      - subscription_id
+      type: object
+      properties:
+        subscription_id:
+          $ref: '#/components/schemas/SubscriptionUUID'
+        notification_index:
+          anyOf:
+          - $ref: '#/components/schemas/RidSubscriptionNotificationIndex'
+          default: 0
+    UUIDv4:
+      description: UUID versão 4.
+      maxLength: 36
+      minLength: 36
+      type: string
+      example: 03e5572a-f733-49af-bc14-8a18bd53ee39
+    Version:
+      description: Versão usada para referenciar um objeto em um dado momento. Toda atualização de um objeto deve informar a versão correspondente, para que as atualizações sejam idempotentes.
+      type: string
+      example: 1hp9apg58umv8
+    EntityUUID:
+      anyOf:
+      - $ref: '#/components/schemas/UUIDv4'
+      description: Identificador universalmente único de uma entidade comunicada pelo DSS, no formato UUIDv4.
+    SubscriptionUUID:
+      anyOf:
+      - $ref: '#/components/schemas/UUIDv4'
+      description: Identificador universalmente único de uma subscription comunicada pelo DSS, no formato UUIDv4.
+    RIDFlightID:
+      description: |-
+        ID no formato UUIDv4. Se o voo tiver uma operational intent reference, este ID deve ser o mesmo da referência.
+      maxLength: 36
+      minLength: 36
+      type: string
+      example: 2f8343be-6482-4d1b-a474-16847e01af1e
+    RIDAuthData:
+      description: Dados adicionais de autenticação.
+      type: object
+      properties:
+        format:
+          description: |
+            Formato dos dados adicionais de autenticação.
+
+            0: Nenhum
+            1: Assinatura do UAS ID
+            2: Assinatura do Operator ID
+            3: Assinatura do conjunto de mensagens
+            4: Autenticação fornecida pelo Remote ID em rede
+            5: Método específico
+            6-9: Reservados para a norma
+            10-15: Disponíveis para uso privado
+          type: integer
+          default: 0
+          minimum: 0
+          exclusiveMinimum: false
+          maximum: 15
+          exclusiveMaximum: false
+        data:
+          description: Dados de autenticação, no formato indicado em `format`.
+          type: string
+          default: ''
+    GetFlightDetailsResponse:
+      description: Resposta de um Service Provider a uma consulta dos detalhes de um voo.
+      required:
+      - details
+      type: object
+      properties:
+        details:
+          $ref: '#/components/schemas/RIDFlightDetails'
+    HorizontalAccuracy:
+      description: |
+        Baseado no NACp do ADS-B (mais um incremento).
+
+        `HAUnknown`: precisão horizontal desconhecida
+
+        `HA10NMPlus`: > 10 NM (18,52 km)
+
+        `HA10NM`: < 10 NM (18,52 km)
+
+        `HA4NM`: < 4 NM (7,408 km)
+
+        `HA2NM`: < 2 NM (3,704 km)
+
+        `HA1NM`: < 1 NM (1852 m)
+
+        `HA05NM`: < 0,5 NM (926 m)
+
+        `HA03NM`: < 0,3 NM (555,6 m)
+
+        `HA01NM`: < 0,1 NM (185,2 m)
+
+        `HA005NM`: < 0,05 NM (92,6 m)
+
+        `HA30m`: < 30 m
+
+        `HA10m`: < 10 m
+
+        `HA3m`: < 3 m
+
+        `HA1m`: < 1 m
+      enum:
+      - HAUnknown
+      - HA10NMPlus
+      - HA10NM
+      - HA4NM
+      - HA2NM
+      - HA1NM
+      - HA05NM
+      - HA03NM
+      - HA01NM
+      - HA005NM
+      - HA30m
+      - HA10m
+      - HA3m
+      - HA1m
+      type: string
+      default: HAUnknown
+    VerticalAccuracy:
+      description: |
+        Baseado na precisão vertical geodésica (GVA) do ADS-B (mais três incrementos).
+
+        `VAUnknown`: precisão vertical desconhecida
+
+        `VA150mPlus`: > 150 m
+
+        `VA150m`: < 150 m
+
+        `VA45m`: < 45 m
+
+        `VA25m`: < 25 m
+
+        `VA10m`: < 10 m
+
+        `VA3m`: < 3 m
+
+        `VA1m`: < 1 m
+      enum:
+      - VAUnknown
+      - VA150mPlus
+      - VA150m
+      - VA45m
+      - VA25m
+      - VA10m
+      - VA3m
+      - VA1m
+      type: string
+      default: VAUnknown
+    RidErrorResponse:
+      description: Dados devolvidos quando ocorre uma condição fora do normal.
+      type: object
+      properties:
+        message:
+          description: Mensagem legível que indica o erro e/ou o motivo.
+          type: string
+          default: ''
+    SpeedAccuracy:
+      description: |
+        Qualidade (contenção) da velocidade horizontal em relação ao solo.
+
+        `SAUnknown`: precisão de velocidade desconhecida
+
+        `SA10mpsPlus`: > 10 m/s
+
+        `SA10mps`: < 10 m/s
+
+        `SA3mps`: < 3 m/s
+
+        `SA1mps`: < 1 m/s
+
+        `SA03mps`: < 0,3 m/s
+      enum:
+      - SAUnknown
+      - SA10mpsPlus
+      - SA10mps
+      - SA3mps
+      - SA1mps
+      - SA03mps
+      type: string
+      default: SAUnknown
+    RIDAircraftPosition:
+      description: Posição de uma aeronave informada para fins de Remote ID.
+      type: object
+      properties:
+        lat:
+          anyOf:
+          - $ref: '#/components/schemas/RidLatitude'
+        lng:
+          anyOf:
+          - $ref: '#/components/schemas/RidLongitude'
+        alt:
+          format: float
+          description: 'Altitude geodésica (NÃO é altitude acima do ponto de decolagem, acima do solo nem EGM96): distância da aeronave acima do elipsoide WGS84, medida ao longo da linha que passa pela aeronave e é normal à superfície do elipsoide. Em metros, com resolução mínima de 1 metro. Inválido, sem valor ou desconhecido é -1000 m.'
+          type: number
+          example: 100
+          default: -1000
+        accuracy_h:
+          anyOf:
+          - $ref: '#/components/schemas/HorizontalAccuracy'
+          description: Erro horizontal provável da posição informada. Obrigatório quando `extrapolated` é verdadeiro e sempre na entrada do estado atual.
+        accuracy_v:
+          anyOf:
+          - $ref: '#/components/schemas/VerticalAccuracy'
+          description: Erro vertical provável da posição informada. Obrigatório quando `extrapolated` é verdadeiro e sempre na entrada do estado atual.
+        extrapolated:
+          description: Verdadeiro se esta posição foi gerada principalmente por cálculo, e não por medição direta de um instrumento. Se não for informado, vale falso.
+          type: boolean
+          default: false
+        pressure_altitude:
+          format: float
+          description: Altitude não corrigida (com base na referência padrão de 29,92 inHg, 1013,25 mb), usada por algoritmos que trabalham com "diferenças de altitude" entre aeronaves. Em metros, com resolução mínima de 1 metro. Inválido, sem valor ou desconhecido é -1000 m.
+          type: number
+          default: -1000
+        height:
+          $ref: '#/components/schemas/RIDHeight'
+    RIDHeight:
+      description: Altura relativa, para fins de Remote ID.
+      required:
+      - reference
+      type: object
+      properties:
+        distance:
+          format: float
+          description: Distância acima do referencial. Em metros, com resolução mínima de 1 metro. Inválido, sem valor ou desconhecido é -1000 m.
+          type: number
+          default: 0
+        reference:
+          description: Referencial acima do qual a altura é informada.
+          enum:
+          - TakeoffLocation
+          - GroundLevel
+          type: string
+    RidLatitude:
+      format: double
+      description: Graus de latitude ao norte do equador, em relação ao elipsoide WGS84. Inválido, sem valor ou desconhecido é 0 grau (em latitude e longitude).
+      maximum: 90
+      exclusiveMaximum: false
+      minimum: -90
+      exclusiveMinimum: false
+      type: number
+      example: -23.5505
+      default: 0
+    RidLongitude:
+      format: double
+      description: Graus de longitude a leste do meridiano de Greenwich, em relação ao elipsoide WGS84. Inválido, sem valor ou desconhecido é 0 grau (em latitude e longitude).
+      maximum: 180
+      exclusiveMaximum: false
+      minimum: -180
+      exclusiveMinimum: false
+      type: number
+      example: -46.6333
+      default: 0
+    RidLatLngPoint:
+      description: Ponto na superfície da Terra.
+      required:
+      - lat
+      - lng
+      type: object
+      properties:
+        lng:
+          $ref: '#/components/schemas/RidLongitude'
+        lat:
+          $ref: '#/components/schemas/RidLatitude'
+    RidAltitude:
+      type: object
+      required:
+      - value
+      - reference
+      - units
+      properties:
+        value:
+          description: >-
+            Valor numérico da altitude. Os valores mínimo e máximo servem como verificação de sanidade e podem ser revistos à medida que novas unidades ou referenciais forem permitidos. Inválido, sem valor ou desconhecido é –1000 m.
+          type: number
+          format: double
+          minimum: -8000
+          exclusiveMinimum: false
+          maximum: 100000
+          exclusiveMaximum: false
+          example: 120
+        reference:
+          description: >-
+            Código do referencial da distância vertical. Ver AIXM 5.1 e FIXM 4.2.0. Hoje o UTM só aceita WGS84, sem planos imediatos de aceitar outros. FIXM e AIXM aceitam 'SFC', equivalente a AGL.
+          type: string
+          enum:
+          - W84
+        units:
+          description: >-
+            Unidade usada para expressar a altitude. Ver FIXM 4.2. Hoje o UTM só aceita metros, sem planos imediatos de aceitar outras.
+          type: string
+          enum:
+          - M
+    RIDFlight:
+      description: Descrição de um voo no Remote ID.
+      required:
+      - id
+      - aircraft_type
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/RIDFlightID'
+        aircraft_type:
+          anyOf:
+          - $ref: '#/components/schemas/UAType'
+          description: Tipo genérico da aeronave.
+        current_state:
+          anyOf:
+          - $ref: '#/components/schemas/RIDAircraftState'
+          description: |
+            Estado mais atual da aeronave. Obrigatório quando a aeronave está na área pedida, a menos que não se espere telemetria durante o voo e `volumes` seja informado.
+
+            Se o Service Provider não estiver recebendo dados atuais do UAS, a falta de mudança neste campo basta para indicar isso.
+
+            Se o SW-USS acredita que o voo está no ar e espera receber telemetria em algum momento, mas ainda não recebeu, este campo deve trazer a melhor estimativa da posição do voo, com as indicações de precisão adequadas.
+        operating_area:
+          description: |
+            Área em que a aeronave (ou as aeronaves) está. Obrigatório, com 1 ou mais itens, se `current_state` não for informado; `time_start` e `time_end` são obrigatórios.
+
+            Se `current_state` for informado, este campo não deve ser informado. Se `current_state` esteve ou deve estar disponível em algum momento do voo, este campo não deve ser informado.
+          anyOf:
+          - $ref: '#/components/schemas/OperatingArea'
+        simulated:
+          description: 'Se verdadeiro, o voo não é de uma aeronave física: é só uma simulação para testar o sistema.'
+          type: boolean
+          default: false
+        recent_positions:
+          description: |
+            Pequena coleção de movimentos recentes da aeronave, informada só quando `recent_positions_duration` é maior que zero. Se `volumes` não for informado e `recent_positions_duration` for maior que zero, este campo é obrigatório.
+
+            As posições recentes devem seguir os requisitos da norma, que em geral proíbem incluir posições fora da área pedida, exceto na transição em que a aeronave entra ou sai da área, e proíbem incluir posições que não sejam recentes o suficiente.
+
+            Uma interface não deve desenhar uma linha entre duas posições consecutivas que estejam ambas fora da área pedida.
+          type: array
+          items:
+            $ref: '#/components/schemas/RIDRecentAircraftPosition'
+          default: []
+    OperatingArea:
+      description: Área de operação com uma ou mais aeronaves participantes da identificação remota.
+      type: object
+      properties:
+        aircraft_count:
+          format: int32
+          description: Permite operar uma única UA, um grupo, uma formação ou um enxame. Quantidade no grupo.
+          minimum: 1
+          exclusiveMinimum: false
+          type: integer
+          example: 1
+        volumes:
+          description: Área em que uma operação de grupo, ou de um participante de rede baseado em intenção, está planejada ou em andamento.
+          type: array
+          items:
+            $ref: '#/components/schemas/RidVolume4D'
+          default: []
+    RidPolygon:
+      description: >-
+        Área fechada sobre a Terra. As arestas do polígono são os caminhos mais curtos entre vértices consecutivos. Isso significa, por exemplo, que a aresta entre dois pontos de mesma latitude em geral não fica sobre essa latitude. A ordem dos vértices deve ser interpretada como a que produz a menor área. As arestas não podem se cruzar e os vértices não podem se repetir; em particular, o último vértice não pode ser igual ao primeiro.
+      required:
+      - vertices
+      type: object
+      properties:
+        vertices:
+          minItems: 3
+          type: array
+          items:
+            $ref: '#/components/schemas/RidLatLngPoint'
+    PutIdentificationServiceAreaNotificationParameters:
+      description: Parâmetros de uma mensagem com as informações completas, novas, de uma Identification Service Area. Enviada por um cliente (não pelo DSS) diretamente aos clientes com subscriptions, quando outro cliente altera o espaço aéreo em uma área coberta por uma subscription.
+      required:
+      - subscriptions
+      type: object
+      properties:
+        service_area:
+          anyOf:
+          - $ref: '#/components/schemas/IdentificationServiceArea'
+          description: |
+            Identification Service Area que o cliente que notifica alterou ou criou.
+
+            Se este campo estiver preenchido, a ISA foi criada ou atualizada. Se não estiver, a ISA foi removida.
+        subscriptions:
+          description: Subscription(s) que motivaram esta notificação.
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/RidSubscriptionState'
+        extents:
+          anyOf:
+          - $ref: '#/components/schemas/RidVolume4D'
+          description: |
+            Volumes, novos ou atualizados, da Identification Service Area.
+
+            Omitido se a ISA foi removida.
+    RIDOperationalStatus:
+      description: |-
+        O status operacional indica se a UA está no solo, no ar ou em emergência, ou se o sistema de Remote ID falhou. O status de emergência tem precedência sobre os demais. Pode ser usado para filtrar.
+      enum:
+      - Undeclared
+      - Ground
+      - Airborne
+      - Emergency
+      - RemoteIDSystemFailure
+      type: string
+      default: Undeclared
+    UASID:
+      description: Identificação do UAS que faz este voo.
+      type: object
+      properties:
+        registration_id:
+          description: Registro da aeronave, emitido pela autoridade. No Brasil, é o SISANT da aeronave.
+          type: string
+          example: PP-999999999
+          default: ''
+    RIDFlightDetails:
+      description: Detalhes de um voo informados por um Service Provider do Remote ID. Pelo menos um dos campos de registro ou de número de série deve ser preenchido, se a autoridade exigir.
+      required:
+      - id
+      type: object
+      properties:
+        id:
+          description: ID deste voo, igual ao do argumento da requisição.
+          type: string
+          example: 2f8343be-6482-4d1b-a474-16847e01af1e
+        uas_id:
+          $ref: '#/components/schemas/UASID'
+        operator_id:
+          description: >-
+            Identificação do operador. No Brasil, é o número de um documento de identificação do operador: CPF, RG, passaporte ou outro documento de identificação aceito no Brasil. É um dado pessoal, devolvido ao DECEA e a qualquer Display Provider.
+          type: string
+          default: ''
+          example: '000.000.000-00'
+        operator_location:
+          anyOf:
+          - $ref: '#/components/schemas/RidLatLngPoint'
+          description: Localização de quem controla a aeronave.
+        operation_description:
+          description: Texto livre em que o operador pode descrever a finalidade do voo, se quiser.
+          type: string
+          example: Inspeção de telhado com drone multirrotor.
+          default: ''
+        auth_data:
+          $ref: '#/components/schemas/RIDAuthData'
+    RIDRecentAircraftPosition:
+      description: ''
+      required:
+      - time
+      - position
+      type: object
+      properties:
+        time:
+          description: Momento a que esta posição se refere.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        position:
+          $ref: '#/components/schemas/RIDAircraftPosition'
+    GetIdentificationServiceAreaDetailsResponse:
+      description: Resposta a um pedido dos detalhes da Identification Service Area com o ID informado.
+      required:
+      - extents
+      type: object
+      properties:
+        extents:
+          anyOf:
+          - $ref: '#/components/schemas/RidVolume4D'
+          description: Volumes da Identification Service Area.
+    IdentificationServiceArea:
+      description: Uma Identification Service Area (área em que um SW-USS presta serviço de Remote ID). O DSS informa apenas estas declarações; os clientes trocam as informações dos voos diretamente entre si (peer-to-peer).
+      required:
+      - uss_base_url
+      - owner
+      - time_start
+      - time_end
+      - version
+      - id
+      type: object
+      properties:
+        uss_base_url:
+          $ref: '#/components/schemas/FlightsUSSBaseURL'
+        owner:
+          description: Atribuído pelo DSS com o ID do cliente que a criou (via token de acesso). Usado para restringir alterações e remoções ao `owner`.
+          type: string
+          example: empresa-a
+        time_start:
+          description: Início do serviço.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: Fim do serviço.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        version:
+          $ref: '#/components/schemas/Version'
+        id:
+          anyOf:
+          - $ref: '#/components/schemas/EntityUUID'
+          description: Identificador único desta Identification Service Area.
+    RIDAircraftState:
+      description: Estado de uma aeronave para fins de Remote ID.
+      required:
+      - timestamp
+      - timestamp_accuracy
+      - position
+      - speed_accuracy
+      type: object
+      properties:
+        timestamp:
+          description: Momento em que este estado era válido. Pode ser o horário da fonte, como um GPS, ou o momento em que o sistema calcula os valores com um algoritmo como um filtro de Kalman estendido (EKF). Deve ter resolução mínima de 1/10 de segundo.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        timestamp_accuracy:
+          format: float
+          description: 'Declaração da precisão do `timestamp`: a maior diferença entre o `timestamp` e o momento real de validade de qualquer um destes campos: latitude, longitude, altitude geodésica, altitude de pressão e altura. Em segundos, com precisão de 1/10 de segundo. Corresponde ao limite de incerteza de 95% do `timestamp`.'
+          minimum: 0
+          exclusiveMinimum: false
+          type: number
+          default: 0
+        operational_status:
+          $ref: '#/components/schemas/RIDOperationalStatus'
+        position:
+          $ref: '#/components/schemas/RIDAircraftPosition'
+        track:
+          format: float
+          description: Direção do voo, expressa como ângulo de rumo verdadeiro em relação ao solo, em graus no sentido horário, com resolução mínima de 1 grau. Se a aeronave não estiver se movendo na horizontal, use o valor "desconhecido". O valor 361 indica inválido, sem valor ou desconhecido.
+          maximum: 361
+          exclusiveMaximum: false
+          minimum: 0
+          exclusiveMinimum: false
+          type: number
+          default: 361
+        speed:
+          format: float
+          description: Velocidade em relação ao solo, em metros por segundo. Inválido, sem valor ou desconhecido é 255 m/s; acima de 254,25 m/s, informe 254,25 m/s.
+          minimum: 0
+          exclusiveMinimum: false
+          type: number
+          example: 1.9
+          default: 255
+        speed_accuracy:
+          anyOf:
+          - $ref: '#/components/schemas/SpeedAccuracy'
+          description: Qualidade (contenção) da velocidade horizontal em relação ao solo.
+        vertical_speed:
+          format: float
+          description: Velocidade vertical (para cima), WGS84-HAE, em m/s. Inválido, sem valor ou desconhecido é 63 m/s; acima de 62 m/s, informe 62 m/s.
+          type: number
+          example: 0.2
+          default: 63
+    UAType:
+      description: |
+        O tipo de UA ajuda a inferir desempenho, velocidade e duração dos voos. Por exemplo, uma aeronave de asa fixa em geral só voa para a frente (ao contrário de um multirrotor). Também ajuda a diferenciar tipos de aeronave sem compartilhar informações operacionalmente sensíveis, como a marca e o modelo, que devem ficar disponíveis na consulta do registro. O tipo de UAS também ajuda a correlacionar a observação visual com os dados recebidos. Os tipos foram definidos com base em características de voo distintas.
+
+        `HybridLift` é uma aeronave de asa fixa que decola na vertical. `Helicopter` inclui multirrotores.
+      enum:
+      - NotDeclared
+      - Aeroplane
+      - Helicopter
+      - Gyroplane
+      - HybridLift
+      - Ornithopter
+      - Glider
+      - Kite
+      - FreeBalloon
+      - CaptiveBalloon
+      - Airship
+      - FreeFallOrParachute
+      - Rocket
+      - TetheredPoweredAircraft
+      - GroundObstacle
+      - Other
+      type: string
+      default: NotDeclared
+    USSBaseURL:
+      description: |-
+        URL base da implementação, no SW-USS, de parte ou de toda a API de Remote ID entre SW-USS. A URL completa de um recurso é montada acrescentando, por exemplo, `/uss/{resource}/{id}` a esta URL base. Por isso, ela não pode terminar com '/'. O host é um domínio, não um endereço IP, porque o `intended_audience` dos tokens para este SW-USS é esse domínio, sem a porta.
+      type: string
+      example: https://uss.empresa-a.com.br/rid
+    FlightsUSSBaseURL:
+      description: URL base da implementação da API de SW-USS, incluindo os endpoints `GET flights` e `GET flights/{id}/details`, em que as informações de voo podem ser obtidas.
+      anyOf:
+      - $ref: '#/components/schemas/USSBaseURL'
+    LogSetType:
+      type: string
+      enum:
+      - operational_intent
+      - ocorrencia
+      description: |
+        Tipo do log set.
+        - `operational_intent`: logs de uma operação, do planejamento ao encerramento. O `log_set_id` é o `entityid` da operational intent.
+        - `ocorrencia`: logs de uma ocorrência (ICA 100-48, Art. 40). O `log_set_id` é um UUIDv4 gerado pelo SW-USS quando detecta a ocorrência.
+    OcorrenciaType:
+      type: string
+      enum:
+      - extrapolar_volume_operacional
+      - ingressar_outro_volume_operacional
+      - impactar_aeronave_tripulada
+      - perda_conectividade_operador
+      description: |
+        Tipo de ocorrência, conforme a ICA 100-48, Art. 40.
+        - `extrapolar_volume_operacional`: extrapolar o próprio volume operacional.
+        - `ingressar_outro_volume_operacional`: ingressar inadvertidamente em outro volume operacional.
+        - `impactar_aeronave_tripulada`: impactar a operação de uma aeronave tripulada.
+        - `perda_conectividade_operador`: perder a conectividade entre o operador UAS e o SW-USS.
+    LogSetSummary:
+      type: object
+      description: Resumo de um log set disponível no SW-USS.
+      required:
+      - log_set_id
+      - type
+      - operational_intent_ids
+      - time_start
+      - time_end
+      properties:
+        log_set_id:
+          type: string
+          maxLength: 128
+          description: 'ID do log set, usado em `GET /uss/v1/log_sets/{log_set_id}`: o `entityid` da operational intent, nos log sets de operação, ou um UUIDv4 gerado pelo SW-USS, nos de ocorrência.'
+          example: 2f8343be-6482-4d1b-a474-16847e01af1e
+        type:
+          $ref: '#/components/schemas/LogSetType'
+        ocorrencia:
+          anyOf:
+          - $ref: '#/components/schemas/OcorrenciaType'
+          description: Tipo de ocorrência. Só nos log sets do tipo `ocorrencia`.
+        operational_intent_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/EntityID'
+          description: Operational intents a que o log set se refere.
+        time_start:
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+          description: Início do período coberto pelo log set.
+        time_end:
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+          description: Fim do período coberto pelo log set.
+        description:
+          type: string
+          description: Descrição livre do log set; nas ocorrências, o que aconteceu.
+          example: O drone saiu dos volumes planejados por 25 segundos e voltou.
+    ListLogSetsResponse:
+      type: object
+      required:
+      - log_sets
+      description: Resposta à listagem dos log sets de um SW-USS.
+      properties:
+        log_sets:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogSetSummary'
+          description: Log sets que atendem aos filtros.

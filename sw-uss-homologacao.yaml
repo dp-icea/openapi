@@ -1,0 +1,2434 @@
+openapi: 3.0.2
+info:
+  title: 'SW-USS: homologação'
+  version: 1.0.0
+  description: |
+    Interfaces de teste que o SW-USS expõe para a homologação. Quem chama é o BR-UTM Lab (DECEA), não os outros SW-USS; a interface de Versioning também é consultada em produção por um serviço do DECEA.
+
+    As interfaces são uma adaptação das `automated_testing_interfaces` da InterUSS: Flight Planning (v0.7.0), Remote ID Injection (v0.5.1) e Versioning (v0.1.2). Os schemas que elas importavam de outros arquivos da InterUSS foram copiados para `components`, e os campos específicos de outras jurisdições (como os da União Europeia e da Austrália) foram removidos. A interface de Versioning ganhou, no BR-UTM, a versão do SW-USS como um todo (`GET /versioning/versions/sw-uss`) e a listagem dos subsistemas (`GET /versioning/versions`).
+
+    ## Homologação e produção
+
+    **Flight Planning e Remote ID Injection** servem só para a homologação: com elas, o BR-UTM Lab testa as interações e as funções do SW-USS.
+
+    - Cabe à empresa manter ou não esses endpoints em produção. O restante do SW-USS, porém, **deve funcionar em produção exatamente como foi testado na validação**. Se não for possível remover esses endpoints sem outras mudanças no sistema, mantenha-os.
+    - Mantê-los não expõe o SW-USS: eles exigem escopos de teste que os SW-USS comuns não recebem, nem em produção nem em desenvolvimento.
+
+    **Versioning é obrigatória sempre, inclusive em produção.** Um serviço do DECEA em produção confere se a versão do SW-USS é a mesma usada para criar a chave de API de produção em uso.
+
+    ## Processo de homologação
+
+    Pela ICA 100-48 (Art. 14), um SW-USS Aprovado é o software validado pela plataforma BR-UTM Lab, mediante solicitação formal da entidade autorizada. O processo:
+
+    1. A empresa pede a aprovação no Portal BR-UTM, informando um e-mail de contato e a versão do software.
+    2. A equipe do BR-UTM Lab cria um ambiente próprio para a validação e envia a chave de API e os endpoints de acesso. A empresa configura o SW-USS com esses endereços e chaves e responde por e-mail com a URL base destas interfaces (ver "URLs base").
+    3. A equipe faz a validação. O processo é manual, mas em alguns casos usa uma ferramenta automatizada interna, que chama estas interfaces.
+    4. Erros de fácil correção podem ser corrigidos na mesma solicitação; nos demais casos, a solicitação é negada e é preciso fazer outra.
+    5. Com a aprovação, a empresa cria no Portal a chave de API de produção para aquela versão e pode pedir uma Zona UTM.
+    6. No final da homologação, a empresa informa ao DECEA a URL base (ou as URLs base) dos endpoints de logs do SW-USS (`sw-uss.yaml`). O DECEA as registra só para uso interno.
+
+    **Atualizações.** Pela ICA 100-48 (Art. 84), antes de atualizar o SW-USS, o USS submete a versão atualizada à análise do ICEA, que avalia se a modificação é pequena ou grande. Recomenda-se submeter cada nova versão a uma nova validação no BR-UTM Lab. Se a mudança for mínima e a empresa entender que se trata de uma versão menor, ela pode contatar os responsáveis do DECEA pelo SAC antes de abrir uma solicitação de validação. Para avaliar o que mudou entre uma versão e outra, o DECEA consulta as versões dos subsistemas na interface de Versioning.
+
+    ## URLs base
+
+    Os caminhos deste arquivo ficam sob uma URL base escolhida pela empresa, que pode ser diferente das registradas no DSS para as operational intents e para o Remote ID. Ex.: as operational intents em `https://oi.empresa-a.com.br` e estas interfaces em `https://homologacao.empresa-a.com.br`. Informe essa URL base ao DECEA por e-mail, depois do contato da equipe do BR-UTM Lab (passo 2 do processo).
+
+    A URL base precisa ser acessível pelo BR-UTM Lab e não pode terminar com `/`. Em produção, ela também precisa ser acessível pelo serviço do DECEA que consulta a interface de Versioning.
+
+    ## Estrutura interna sugerida
+
+    Primeiramente, cabe à empresa identificar quais componentes internos do SW-USS cada interface deve acionar e implementá-la de forma adequada:
+
+    - **Flight Planning:** esta interface testa o que o operador faz no SW-USS. Por isso, ela deve acionar, da forma mais fiel possível, os mesmos componentes com que o operador interage (interface gráfica, API própria de planejamento, integração com a estação de controle de solo etc.). Se for preciso, implemente-a como um robô que opera esses componentes como um operador faria. Os estados do plano de voo equivalem aos da operational intent: `Planned` → `Accepted`; `InUse` → `Activated`; `Closed` → o voo termina e a operational intent é removida do DSS. Guarde as notificações que o operador veria (como avisos de conflito) para `GET /flight_planning/v1/user_notifications`.
+    - **Remote ID Injection:** da mesma forma, faça a telemetria injetada entrar no SW-USS o mais perto possível do ponto por onde entra a telemetria que o drone envia durante a operação. Assim, os voos injetados seguem o mesmo fluxo dos voos reais e aparecem em `GET /uss/flights` e `GET /uss/flights/{id}/details` (`sw-uss.yaml`) nos instantes certos. O mesmo vale para a telemetria que chega no plano de voo do Flight Planning, que entra no monitoramento de conformidade como se viesse do drone.
+
+    **Formatos.** Os dados recebidos nestas interfaces não vêm no formato das APIs do BR-UTM, de propósito: o plano de voo, por exemplo, não chega como operational intent. O BR-UTM não exige que nenhuma interface interna do SW-USS (como a interface do operador) siga o formato da ASTM F3548-21. As interfaces internas podem usar qualquer formato, mas, no fim, o SW-USS converte os dados para os formatos das APIs do BR-UTM:
+
+    - o plano de voo (`FlightPlan`) vira uma operational intent (`dss.yaml` e `sw-uss.yaml`);
+    - os voos injetados no Remote ID (`TestFlight`) são fornecidos com os schemas de `GET /uss/flights` e `GET /uss/flights/{id}/details` (`sw-uss.yaml`). Por exemplo, o `timestamp` de `RIDAircraftState` é um texto RFC 3339 nesta interface e um objeto `Time` em `sw-uss.yaml`.
+
+    ## Versioning
+
+    A homologação aprova uma versão específica do SW-USS: a informada no Portal BR-UTM no pedido de aprovação. Como o SW-USS pode ser um conjunto de sistemas (APIs, interfaces gráficas, estações de controle de solo etc.), essa versão representa o conjunto. A interface de Versioning informa:
+
+    - **`system_identity` = `sw-uss`** (obrigatório): a versão do SW-USS como um todo, exatamente como informada no Portal BR-UTM. É ela que o serviço do DECEA em produção compara com a versão associada à chave de API em uso.
+    - **Subsistemas** (recomendado): a versão de cada sistema que compõe o SW-USS, com um `system_identity` escolhido pela empresa. O DECEA usa essas versões para ver o que mudou entre uma versão do SW-USS e outra e avaliar se a mudança é pequena ou grande.
+
+    São três endpoints, todos obrigatórios, inclusive em produção:
+
+    - `GET /versioning/versions/sw-uss`: a versão do SW-USS como um todo;
+    - `GET /versioning/versions`: o `sw-uss` e todos os subsistemas, com as suas versões;
+    - `GET /versioning/versions/{system_identity}`: a versão de um subsistema.
+
+    ## Autenticação
+
+    O BR-UTM Lab chama estas interfaces com `Authorization: Bearer <token>`, um token emitido pelo mesmo Auth Server do BR-UTM (a mesma chave valida os tokens do UTM, do Remote ID e destas interfaces). Valide-o como nos demais endpoints do SW-USS: `iss` igual a `ICEA`, `aud` igual ao domínio em que a interface responde e, em `scope`, o escopo exigido, informado no início da descrição de cada endpoint. Responda `401` a um token ausente ou inválido e `403` a um token sem o escopo exigido.
+
+    ## Schemas
+
+    Schemas da injeção de Remote ID com o mesmo nome de um schema do planejamento de voo, mas conteúdo diferente, recebem o prefixo `Rid` (ex.: `RidUserNotification`), assim como o operationId `RidQueryUserNotifications`.
+servers:
+- url: '{uss_base_url}'
+  description: URL base das interfaces de homologação, informada ao DECEA por e-mail
+  variables:
+    uss_base_url:
+      default: https://homologacao.empresa-a.com.br
+      description: URL base, sem `/` no fim
+security:
+- Authority:
+  - interuss.flight_planning.plan
+  - interuss.flight_planning.direct_automated_test
+  - rid.inject_test_data
+  - interuss.versioning.read_system_versions
+tags:
+- name: Flight planning
+  description: |
+    Flight Planning Automated Testing Interface 0.7.0 (InterUSS).
+
+    Interface fornecida por um SW-USS que participa de testes automatizados de planejamento de voos.
+
+    O BR-UTM Lab dá instruções a um usuário virtual que usa a interface de planejamento do SW-USS para planejar, alterar e encerrar planos de voo. O BR-UTM Lab fornece as informações que um usuário forneceria ao SW-USS, e o SW-USS responde só com as informações que daria aos seus usuários normais na mesma ação. O SW-USS deve executar essas ações usando, tanto quanto possível, os mesmos caminhos de código que atendem um usuário normal.
+
+    Com outro escopo, o BR-UTM Lab também pode agir como diretor de testes: verificar o estado do sistema em teste e pedir que a área de teste seja limpa de planos de voo remanescentes. Para isso, o SW-USS pode usar caminhos de código fora do padrão ou não disponíveis aos usuários normais.
+
+    Observação: salvo indicação em contrário, campos de uma mensagem que não estejam declarados na API, ou que não sejam conhecidos pelo servidor ou pelo cliente, devem ser ignorados.
+- name: Remote ID injection
+  description: |
+    Remote ID Test Data Injection 0.5.1 (InterUSS).
+
+    Interface fornecida por todo Service Provider que vai ser testado pelo BR-UTM Lab. O BR-UTM Lab chama esta interface para injetar dados de voo de teste no Service Provider em teste.
+- name: Versioning
+  description: |
+    Versioning Automated Testing Interface 0.1.2 (InterUSS).
+
+    Interface fornecida por um SW-USS para informar, de forma automatizada, as versões do seu software a destinatários autorizados.
+
+    Observação: salvo indicação em contrário, campos de uma mensagem que não estejam declarados na API, ou que não sejam conhecidos pelo servidor ou pelo cliente, devem ser ignorados.
+paths:
+  /flight_planning/v1/status:
+    get:
+      security:
+      - Authority:
+        - interuss.flight_planning.direct_automated_test
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+              examples:
+                pronta:
+                  summary: Interface pronta
+                  value:
+                    status: Ready
+                    api_name: Flight Planning Automated Testing Interface
+                    api_version: v0.7.0
+                iniciando:
+                  summary: Interface ainda iniciando
+                  value:
+                    status: Starting
+                    api_name: Flight Planning Automated Testing Interface
+                    api_version: v0.7.0
+          description: >-
+            Esta interface de teste está disponível, e o seu estado foi obtido com sucesso.
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          description: Esta interface de teste não está disponível.
+      summary: Informa se a interface de planejamento está pronta
+      description: |
+        **Escopo exigido no token de quem chama:** `interuss.flight_planning.direct_automated_test`
+
+        Informa se a interface de planejamento de voo está pronta para os testes: `Starting` (ainda iniciando) ou `Ready` (pronta). O BR-UTM Lab consulta este endpoint antes de começar. Responda `404` se a interface não estiver disponível.
+
+        Em `api_name` e `api_version`, devolva exatamente `Flight Planning Automated Testing Interface` e `v0.7.0`.
+      operationId: GetStatus
+
+      tags:
+      - Flight planning
+  /flight_planning/v1/clear_area_requests:
+    post:
+      security:
+      - Authority:
+        - interuss.flight_planning.direct_automated_test
+
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClearAreaRequest'
+            examples:
+              limpar:
+                summary: Limpar a área de teste no centro de São Paulo
+                value:
+                  request_id: 5b7f9c2e-1d4a-4e8b-a6f3-0c9d2e7b4a51
+                  extent:
+                    volume:
+                      outline_circle:
+                        center:
+                          lat: -23.5505
+                          lng: -46.638
+                        radius:
+                          value: 2000
+                          units: M
+                      altitude_lower:
+                        value: 0
+                        reference: W84
+                        units: M
+                      altitude_upper:
+                        value: 3000
+                        reference: W84
+                        units: M
+                    time_start:
+                      value: '2026-11-05T00:00:00Z'
+                      format: RFC3339
+                    time_end:
+                      value: '2026-11-06T00:00:00Z'
+                      format: RFC3339
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClearAreaResponse'
+              examples:
+                sucesso:
+                  summary: Área limpa
+                  value:
+                    outcome:
+                      success: true
+                falha:
+                  summary: Falha ao limpar a área
+                  value:
+                    outcome:
+                      success: false
+                      message: O DSS respondeu 500 ao remover a operational intent 57e98b17-aefa-4eee-a376-5140e4a8385f.
+                      details:
+                        dss_status: 500
+                        operational_intent_id: 57e98b17-aefa-4eee-a376-5140e4a8385f
+          description: A área foi limpa com sucesso.
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+
+      summary: Limpa uma área de teste
+      operationId: ClearArea
+      description: |
+        **Escopo exigido no token de quem chama:** `interuss.flight_planning.direct_automated_test`
+
+        Pedido do diretor de testes: cancele e remova todos os planos de voo gerenciados pelo seu SW-USS que intersectam `extent`, inclusive as operational intents correspondentes no DSS. Serve para limpar a área entre cenários de teste, e pode usar caminhos de código administrativos.
+
+        - Responda com `success: true` só se todos os planos de voo da área foram cancelados e removidos; caso contrário, explique o problema em `message`.
+        - Se o `request_id` se repetir, devolva a resposta do pedido anterior com o mesmo `request_id`, sem limpar a área de novo.
+
+      tags:
+      - Flight planning
+  /flight_planning/v1/flight_plans/{flight_plan_id}:
+    parameters:
+    - name: flight_plan_id
+      in: path
+      required: true
+      description: Texto no formato UUID que identifica a intenção de plano de voo do usuário.
+      schema:
+        $ref: '#/components/schemas/FlightPlanID'
+
+    put:
+      security:
+      - Authority:
+        - interuss.flight_planning.plan
+
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertFlightPlanRequest'
+            examples:
+              planejar:
+                summary: Planejar um voo (vira uma operational intent Accepted)
+                value:
+                  flight_plan:
+                    basic_information:
+                      usage_state: Planned
+                      uas_state: Nominal
+                      area:
+                      - volume:
+                          outline_polygon:
+                            vertices:
+                            - lat: -23.549
+                              lng: -46.64
+                            - lat: -23.549
+                              lng: -46.636
+                            - lat: -23.552
+                              lng: -46.636
+                            - lat: -23.552
+                              lng: -46.64
+                          altitude_lower:
+                            value: 750
+                            reference: W84
+                            units: M
+                          altitude_upper:
+                            value: 870
+                            reference: W84
+                            units: M
+                        time_start:
+                          value: '2026-11-05T14:00:00Z'
+                          format: RFC3339
+                        time_end:
+                          value: '2026-11-05T14:30:00Z'
+                          format: RFC3339
+                      description: Inspeção de telhado com drone multirrotor.
+                    uas:
+                      aircraft_type: Helicopter
+                      serial_number: 1581F5FHD23D8001A3B2
+                      registration_numbers:
+                      - authority: PP
+                        identifier: PP-999999999
+                    operator:
+                      registration_numbers:
+                      - authority: PP
+                        type: SARPAS
+                        identifier: HUKMBB
+                      location:
+                        lat: -23.5461
+                        lng: -46.6372
+                    astm_f3548_21:
+                      priority: 1
+                  execution_style: IfAllowed
+                  request_id: 3c2a8e71-9b4f-4d6a-8e15-7f0b6c9d2a43
+              ativar:
+                summary: Ativar o voo, com telemetria (vira Activated)
+                value:
+                  flight_plan:
+                    basic_information:
+                      usage_state: InUse
+                      uas_state: Nominal
+                      area:
+                      - volume:
+                          outline_polygon:
+                            vertices:
+                            - lat: -23.549
+                              lng: -46.64
+                            - lat: -23.549
+                              lng: -46.636
+                            - lat: -23.552
+                              lng: -46.636
+                            - lat: -23.552
+                              lng: -46.64
+                          altitude_lower:
+                            value: 750
+                            reference: W84
+                            units: M
+                          altitude_upper:
+                            value: 870
+                            reference: W84
+                            units: M
+                        time_start:
+                          value: '2026-11-05T14:00:00Z'
+                          format: RFC3339
+                        time_end:
+                          value: '2026-11-05T14:30:00Z'
+                          format: RFC3339
+                      description: Inspeção de telhado com drone multirrotor.
+                    uas:
+                      aircraft_type: Helicopter
+                      serial_number: 1581F5FHD23D8001A3B2
+                      registration_numbers:
+                      - authority: PP
+                        identifier: PP-999999999
+                    operator:
+                      registration_numbers:
+                      - authority: PP
+                        type: SARPAS
+                        identifier: HUKMBB
+                      location:
+                        lat: -23.5461
+                        lng: -46.6372
+                    astm_f3548_21:
+                      priority: 1
+                    telemetry:
+                      states:
+                      - id: estado-0001
+                        timestamp:
+                          value: '2026-11-05T14:05:00Z'
+                          format: RFC3339
+                        timestamp_accuracy: 0.5
+                        position:
+                          location:
+                            lat: -23.5505
+                            lng: -46.639
+                          altitudes:
+                          - value: 800
+                            reference: W84
+                            units: M
+                          accuracy_h: HA3m
+                          accuracy_v: VA3m
+                        operational_status: Airborne
+                        uas_state: Nominal
+                        track: 90.0
+                        speed: 5.0
+                        speed_accuracy: SA1mps
+                        vertical_speed: 0.0
+                      - id: estado-0002
+                        timestamp:
+                          value: '2026-11-05T14:05:01Z'
+                          format: RFC3339
+                        timestamp_accuracy: 0.5
+                        position:
+                          location:
+                            lat: -23.5505
+                            lng: -46.63895
+                          altitudes:
+                          - value: 800
+                            reference: W84
+                            units: M
+                          accuracy_h: HA3m
+                          accuracy_v: VA3m
+                        operational_status: Airborne
+                        uas_state: Nominal
+                        track: 90.0
+                        speed: 5.0
+                        speed_accuracy: SA1mps
+                        vertical_speed: 0.0
+                  execution_style: IfAllowed
+                  request_id: 9e4d1f63-2a7b-4c8e-b5d0-6a1f3e8c7b29
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpsertFlightPlanResponse'
+              examples:
+                planejado:
+                  summary: Voo planejado
+                  value:
+                    planning_result: Completed
+                    flight_plan_status: Planned
+                    includes_advisories: NoAdvisoriesOrConditions
+                ativado:
+                  summary: Voo ativado
+                  value:
+                    planning_result: Completed
+                    flight_plan_status: OkToFly
+                    includes_advisories: NoAdvisoriesOrConditions
+                rejeitado:
+                  summary: Voo rejeitado por conflito
+                  value:
+                    planning_result: Rejected
+                    notes: O voo pedido intersecta a operational intent c036326c-c97b-4926-bf9f-c60dc83d2b57, de outro SW-USS.
+                    flight_plan_status: NotPlanned
+                    includes_advisories: AtLeastOneAdvisoryOrCondition
+          description: Os dados foram processados com sucesso.
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '409':
+          description: A requisição tem um `request_id` repetido e a resposta daquele pedido não está disponível, ou houve outro conflito.
+
+      summary: Cria ou altera um plano de voo (usuário virtual)
+      operationId: UpsertFlightPlan
+      description: |
+        **Escopo exigido no token de quem chama:** `interuss.flight_planning.plan`
+
+        Simula um operador pedindo para criar ou alterar um voo. Trate como um pedido real, pelo mesmo caminho de código usado pela sua interface do operador: verificação da Zona UTM, consulta ao DSS, desconflitação e criação ou alteração da operational intent.
+
+        - `flight_plan_id` é o ID do voo do ponto de vista do usuário (UUID). Pedidos seguintes com o mesmo ID alteram o mesmo voo.
+        - `flight_plan.basic_information.usage_state` diz o que o usuário está fazendo: `Planned` (voo planejado), `InUse` (voo em andamento) ou `Closed` (voo encerrado).
+        - `execution_style`: `Hypothetical` (só informe o resultado provável), `IfAllowed` (execute se for permitido) ou `InReality` (o usuário já está fazendo isso, seja permitido ou não).
+        - `flight_plan.telemetry` traz posições a entregar ao seu sistema nos instantes indicados, como se viessem do drone; elas alimentam o monitoramento de conformidade.
+        - Responda com `planning_result` (`Completed`, `Rejected`, `Failed` ou `NotSupported`) e `flight_plan_status`. Em qualquer resultado diferente de `Completed`, explique o motivo em `notes`. Por exemplo, um pedido que conflita com outra operational intent resulta em `Rejected`.
+        - Se o `request_id` se repetir, devolva a resposta do primeiro pedido com o mesmo `request_id`, sem executar a ação de novo. Responda `409` só se essa resposta não estiver mais disponível.
+
+        Os testes também verificam o comportamento do SW-USS com prioridades maiores e menores, embora no BR-UTM se use uma única prioridade por enquanto.
+
+      tags:
+      - Flight planning
+    delete:
+      security:
+      - Authority:
+        - interuss.flight_planning.direct_automated_test
+
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteFlightPlanResponse'
+              examples:
+                removido:
+                  summary: Plano de voo removido
+                  value:
+                    planning_result: Completed
+                    flight_plan_status: Closed
+                    includes_advisories: NoAdvisoriesOrConditions
+                falha:
+                  summary: Falha ao remover
+                  value:
+                    planning_result: Failed
+                    notes: O DSS não respondeu ao pedido de remoção da operational intent 2f8343be-6482-4d1b-a474-16847e01af1e.
+                    flight_plan_status: Planned
+                    includes_advisories: Unknown
+          description: O plano de voo foi removido com sucesso.
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          description: O plano de voo não foi encontrado (talvez já tenha sido removido).
+
+      summary: Remove um plano de voo
+      operationId: DeleteFlightPlan
+      description: |
+        **Escopo exigido no token de quem chama:** `interuss.flight_planning.direct_automated_test`
+
+        Pedido do diretor de testes: encerre e remova um plano de voo que não é mais necessário para os testes, inclusive a operational intent correspondente no DSS. Responda `404` se o plano de voo não existir (talvez já tenha sido removido).
+
+      tags:
+      - Flight planning
+  /flight_planning/v1/user_notifications:
+    get:
+      operationId: QueryUserNotifications
+      security:
+      - Authority:
+        - interuss.flight_planning.plan
+      parameters:
+      - name: after
+        description: >-
+          Não inclua notificações observadas antes deste instante. A comparação usa a propriedade `observed_at` de `UserNotification`.
+        schema:
+          type: string
+          format: date-time
+        example: '2026-11-05T13:45:00Z'
+        in: query
+        required: true
+      - name: before
+        description: >-
+          Não inclua notificações observadas depois deste instante, que deve ser posterior ao de `after`. Se não for informado, vale o momento atual. A comparação usa a propriedade `observed_at` de `UserNotification`.
+        schema:
+          type: string
+          format: date-time
+        example: '2026-11-05T14:45:00Z'
+        in: query
+        required: false
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryUserNotificationsResponse'
+              examples:
+                conflito:
+                  summary: Aviso de conflito mostrado ao operador
+                  value:
+                    user_notifications:
+                    - observed_at:
+                        value: '2026-11-05T13:50:02Z'
+                        format: RFC3339
+                      message: 'Conflito com outra operação na área: o voo não pode ser planejado.'
+                      conflicts: Single
+          description: As notificações ao usuário foram obtidas com sucesso.
+        '400':
+          description: Faltou o parâmetro `after`, ou a requisição é inválida por outro motivo.
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+      summary: Consulta as notificações do usuário virtual (planejamento)
+      description: |
+        **Escopo exigido no token de quem chama:** `interuss.flight_planning.plan`
+
+        Devolve as notificações que o usuário virtual observou (por exemplo, avisos de conflito) no intervalo entre `after` e `before`. As notificações devem ficar disponíveis até o fim da execução do teste e aparecer na consulta até 5 segundos depois de observadas.
+      tags:
+      - Flight planning
+  /ridsp/injection/tests/{test_id}:
+    parameters:
+    - examples:
+        default:
+          value: '2979bd18-7f06-441c-bda6-e82c841c35d6'
+      name: test_id
+      description: >-
+        ID do teste.
+      schema:
+        type: string
+      in: path
+      required: true
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTestParameters'
+            examples:
+              um_voo:
+                summary: Um voo com duas posições
+                value:
+                  requested_flights:
+                  - injection_id: edb7695f-8737-4b9f-91f8-e2afbb333f41
+                    aircraft_type: Helicopter
+                    telemetry:
+                    - timestamp: '2026-11-05T14:05:00Z'
+                      timestamp_accuracy: 0.5
+                      operational_status: Airborne
+                      position:
+                        lat: -23.5505
+                        lng: -46.639
+                        alt: 800.0
+                        accuracy_h: HA3m
+                        accuracy_v: VA3m
+                        extrapolated: false
+                      height:
+                        distance: 40.0
+                        reference: TakeoffLocation
+                      track: 90.0
+                      speed: 5.0
+                      speed_accuracy: SA1mps
+                      vertical_speed: 0.0
+                    - timestamp: '2026-11-05T14:05:01Z'
+                      timestamp_accuracy: 0.5
+                      operational_status: Airborne
+                      position:
+                        lat: -23.5505
+                        lng: -46.63895
+                        alt: 800.0
+                        accuracy_h: HA3m
+                        accuracy_v: VA3m
+                        extrapolated: false
+                      height:
+                        distance: 40.0
+                        reference: TakeoffLocation
+                      track: 90.0
+                      speed: 5.0
+                      speed_accuracy: SA1mps
+                      vertical_speed: 0.0
+                    details_responses:
+                    - effective_after: '2026-11-05T14:00:00Z'
+                      details:
+                        id: 0e6c3b9f-4a2d-4f7e-9c1b-2d5e8f3a7b10
+                        operator_id: '000.000.000-00'
+                        operator_location:
+                          lat: -23.5461
+                          lng: -46.6372
+                        operation_description: Inspeção de telhado com drone multirrotor.
+                        uas_id:
+                          registration_id: PP-999999999
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeTestResponse'
+              examples:
+                criado:
+                  summary: Teste criado
+                  value:
+                    injected_flights:
+                    - injection_id: edb7695f-8737-4b9f-91f8-e2afbb333f41
+                      aircraft_type: Helicopter
+                      telemetry:
+                      - timestamp: '2026-11-05T14:05:00Z'
+                        timestamp_accuracy: 0.5
+                        operational_status: Airborne
+                        position:
+                          lat: -23.5505
+                          lng: -46.639
+                          alt: 800.0
+                          accuracy_h: HA3m
+                          accuracy_v: VA3m
+                          extrapolated: false
+                        height:
+                          distance: 40.0
+                          reference: TakeoffLocation
+                        track: 90.0
+                        speed: 5.0
+                        speed_accuracy: SA1mps
+                        vertical_speed: 0.0
+                      - timestamp: '2026-11-05T14:05:01Z'
+                        timestamp_accuracy: 0.5
+                        operational_status: Airborne
+                        position:
+                          lat: -23.5505
+                          lng: -46.63895
+                          alt: 800.0
+                          accuracy_h: HA3m
+                          accuracy_v: VA3m
+                          extrapolated: false
+                        height:
+                          distance: 40.0
+                          reference: TakeoffLocation
+                        track: 90.0
+                        speed: 5.0
+                        speed_accuracy: SA1mps
+                        vertical_speed: 0.0
+                      details_responses:
+                      - effective_after: '2026-11-05T14:00:00Z'
+                        details:
+                          id: 0e6c3b9f-4a2d-4f7e-9c1b-2d5e8f3a7b10
+                          operator_id: '000.000.000-00'
+                          operator_location:
+                            lat: -23.5461
+                            lng: -46.6372
+                          operation_description: Inspeção de telhado com drone multirrotor.
+                          uas_id:
+                            registration_id: PP-999999999
+                    version: 1.0.0
+          description: O teste foi criado com sucesso.
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '409':
+          description: O teste já existe.
+      operationId: createTest
+      summary: Injeta voos de teste (Remote ID)
+      description: |
+        **Escopo exigido no token de quem chama:** `rid.inject_test_data`
+
+        Injeta um ou mais voos simulados, com telemetria e detalhes, no Service Provider de Remote ID do seu SW-USS. Trate os voos injetados como voos reais: a telemetria deve aparecer em `GET /uss/flights` nos instantes indicados em `timestamp`, e os detalhes em `GET /uss/flights/{id}/details` a partir de `effective_after`.
+
+        - O `test_id` é gerado pelo BR-UTM Lab. Responda `409` se o teste já existir.
+        - O injetor pode alterar campos como `details.id` quando necessário para funcionar com o seu sistema, o mínimo possível. Os campos `injection_id` não podem ser alterados.
+        - A resposta traz os dados efetivamente injetados e a `version` do teste, necessária para removê-lo.
+      security:
+      - Authority:
+        - rid.inject_test_data
+      tags:
+      - Remote ID injection
+  /ridsp/injection/tests/{test_id}/{version}:
+    parameters:
+    - examples:
+        default:
+          value: '2979bd18-7f06-441c-bda6-e82c841c35d6'
+      name: test_id
+      description: >-
+        ID do teste.
+      schema:
+        type: string
+      in: path
+      required: true
+    - name: version
+      description: >-
+        Versão atual do teste.
+      schema:
+        type: string
+      in: path
+      required: true
+    delete:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteTestResponse'
+              examples:
+                removido:
+                  summary: Teste removido
+                  value:
+                    injected_flights:
+                    - injection_id: edb7695f-8737-4b9f-91f8-e2afbb333f41
+                      aircraft_type: Helicopter
+                      telemetry:
+                      - timestamp: '2026-11-05T14:05:00Z'
+                        timestamp_accuracy: 0.5
+                        operational_status: Airborne
+                        position:
+                          lat: -23.5505
+                          lng: -46.639
+                          alt: 800.0
+                          accuracy_h: HA3m
+                          accuracy_v: VA3m
+                          extrapolated: false
+                        height:
+                          distance: 40.0
+                          reference: TakeoffLocation
+                        track: 90.0
+                        speed: 5.0
+                        speed_accuracy: SA1mps
+                        vertical_speed: 0.0
+                      - timestamp: '2026-11-05T14:05:01Z'
+                        timestamp_accuracy: 0.5
+                        operational_status: Airborne
+                        position:
+                          lat: -23.5505
+                          lng: -46.63895
+                          alt: 800.0
+                          accuracy_h: HA3m
+                          accuracy_v: VA3m
+                          extrapolated: false
+                        height:
+                          distance: 40.0
+                          reference: TakeoffLocation
+                        track: 90.0
+                        speed: 5.0
+                        speed_accuracy: SA1mps
+                        vertical_speed: 0.0
+                      details_responses:
+                      - effective_after: '2026-11-05T14:00:00Z'
+                        details:
+                          id: 0e6c3b9f-4a2d-4f7e-9c1b-2d5e8f3a7b10
+                          operator_id: '000.000.000-00'
+                          operator_location:
+                            lat: -23.5461
+                            lng: -46.6372
+                          operation_description: Inspeção de telhado com drone multirrotor.
+                          uas_id:
+                            registration_id: PP-999999999
+          description: O teste foi removido com sucesso.
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          description: O teste não foi encontrado (talvez já tenha sido removido).
+      operationId: deleteTest
+      summary: Remove um teste (Remote ID)
+      description: |
+        **Escopo exigido no token de quem chama:** `rid.inject_test_data`
+
+        Remove todos os dados injetados neste teste. Envie no caminho a `version` devolvida na criação do teste. Responda `404` se o teste não existir (talvez já tenha sido removido).
+      security:
+      - Authority:
+        - rid.inject_test_data
+      tags:
+      - Remote ID injection
+  /ridsp/injection/user_notifications:
+    get:
+      operationId: RidQueryUserNotifications
+      security:
+      - Authority:
+        - rid.inject_test_data
+      parameters:
+      - name: after
+        description: >-
+          Não inclua notificações observadas antes deste instante. A comparação usa a propriedade `observed_at` de `UserNotification`.
+        schema:
+          type: string
+          format: date-time
+        example: '2026-11-05T13:45:00Z'
+        in: query
+        required: true
+      - name: before
+        description: >-
+          Não inclua notificações observadas depois deste instante, que deve ser posterior ao de `after`. Se não for informado, vale o momento atual. A comparação usa a propriedade `observed_at` de `UserNotification`.
+        schema:
+          type: string
+          format: date-time
+        example: '2026-11-05T14:45:00Z'
+        in: query
+        required: false
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidQueryUserNotificationsResponse'
+              examples:
+                perda_conexao:
+                  summary: Aviso mostrado ao operador
+                  value:
+                    user_notifications:
+                    - observed_at:
+                        value: '2026-11-05T14:12:30Z'
+                        format: RFC3339
+                      message: 'Perda de conexão com o drone: a telemetria do voo foi interrompida.'
+          description: As notificações ao usuário foram obtidas com sucesso.
+        '400':
+          description: Faltou o parâmetro `after`, ou a requisição é inválida por outro motivo.
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+      summary: Consulta as notificações do usuário virtual (Remote ID)
+      description: |
+        **Escopo exigido no token de quem chama:** `rid.inject_test_data`
+
+        Devolve as notificações que o usuário virtual observou (por exemplo, avisos de conflito) no intervalo entre `after` e `before`. As notificações devem ficar disponíveis até o fim da execução do teste e aparecer na consulta até 5 segundos depois de observadas.
+      tags:
+      - Remote ID injection
+  /versioning/versions:
+    get:
+      security:
+      - Authority:
+        - interuss.versioning.read_system_versions
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListVersionsResponse'
+              examples:
+                com_subsistemas:
+                  summary: SW-USS com três subsistemas
+                  value:
+                    versions:
+                    - system_identity: sw-uss
+                      system_version: v2.3.0
+                      description: Versão do SW-USS informada no Portal BR-UTM
+                    - system_identity: api-operational-intents
+                      system_version: v1.8.2
+                      description: API que responde os endpoints de operational intents e constraints
+                    - system_identity: api-remote-id
+                      system_version: v1.4.0
+                      description: API que responde os endpoints do Remote ID
+                    - system_identity: app-operador
+                      system_version: v3.1.0
+                      description: Aplicativo web em que o operador planeja e acompanha os voos
+                sem_subsistemas:
+                  summary: SW-USS que não informa subsistemas
+                  value:
+                    versions:
+                    - system_identity: sw-uss
+                      system_version: v2.3.0
+          description: >-
+            A interface listou a versão do SW-USS e as versões dos subsistemas.
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+      summary: Lista as versões do SW-USS e dos subsistemas
+      description: |
+        **Escopo exigido no token de quem chama:** `interuss.versioning.read_system_versions`
+
+        **Quem chama:** o BR-UTM Lab, na homologação, e um serviço do DECEA, em produção.
+
+        Endpoint do BR-UTM (não existe na interface da InterUSS). Lista todos os `system_identity` que o seu SW-USS informa, cada um com a sua versão:
+
+        - **`sw-uss`**: sempre presente. A versão do SW-USS como um todo, exatamente como informada no Portal BR-UTM no pedido de aprovação.
+        - **Subsistemas**: um item por sistema que compõe o SW-USS (APIs, interfaces gráficas, estações de controle de solo etc.), com o `system_identity` escolhido pela empresa. Recomenda-se informá-los: o DECEA compara essas versões entre uma versão do SW-USS e outra para ver o que mudou e avaliar se a mudança é pequena ou grande. Use `description` para dizer o que cada subsistema faz.
+
+        Todo `system_identity` desta lista também deve ser aceito em `GET /versioning/versions/{system_identity}`, com a mesma versão.
+
+        Este endpoint é obrigatório, inclusive em produção.
+      operationId: ListVersions
+      tags:
+      - Versioning
+  /versioning/versions/sw-uss:
+    get:
+      security:
+      - Authority:
+        - interuss.versioning.read_system_versions
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetVersionResponse'
+              examples:
+                sw_uss:
+                  summary: Versão do SW-USS
+                  value:
+                    system_identity: sw-uss
+                    system_version: v2.3.0
+          description: >-
+            A interface informou a versão do SW-USS.
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+      summary: Informa a versão do SW-USS
+      description: |
+        **Escopo exigido no token de quem chama:** `interuss.versioning.read_system_versions`
+
+        **Quem chama:** o BR-UTM Lab, na homologação, e um serviço do DECEA, em produção.
+
+        Endpoint do BR-UTM. Devolve a versão do SW-USS como um todo, com `system_identity` igual a `sw-uss`.
+
+        - **Qual versão:** exatamente a informada no Portal BR-UTM no pedido de aprovação. Como o SW-USS pode ser um conjunto de sistemas (APIs, interfaces gráficas, estações de controle de solo etc.), essa versão representa o conjunto, qualquer que seja a versão de cada subsistema.
+        - **Na homologação:** o BR-UTM Lab confere que a versão em teste é a do pedido de aprovação.
+        - **Em produção:** um serviço do DECEA compara esta versão com a versão associada à chave de API de produção em uso.
+
+        Este endpoint é obrigatório, inclusive em produção. Ele corresponde a `GET /versioning/versions/{system_identity}` com `system_identity` igual a `sw-uss`, e por isso nunca responde `404`.
+      operationId: GetSwUssVersion
+      tags:
+      - Versioning
+  /versioning/versions/{system_identity}:
+    parameters:
+    - name: system_identity
+      in: path
+      required: true
+      description: >-
+        Identidade de um dos subsistemas listados em `GET /versioning/versions`. A versão do SW-USS como um todo (`sw-uss`) tem o seu próprio endpoint, `GET /versioning/versions/sw-uss`.
+      schema:
+        $ref: '#/components/schemas/SystemBoundaryIdentifier'
+      example: api-operational-intents
+
+    get:
+      security:
+      - Authority:
+        - interuss.versioning.read_system_versions
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetVersionResponse'
+              examples:
+                subsistema:
+                  summary: Versão de um subsistema
+                  value:
+                    system_identity: api-operational-intents
+                    system_version: v1.8.2
+          description: >-
+            A interface informou a versão do subsistema pedido.
+        '401':
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          description: O `system_identity` pedido não é um dos subsistemas listados em `GET /versioning/versions`.
+      summary: Informa a versão de um subsistema
+      description: |
+        **Escopo exigido no token de quem chama:** `interuss.versioning.read_system_versions`
+
+        **Quem chama:** o BR-UTM Lab, na homologação, e um serviço do DECEA, em produção.
+
+        Devolve a versão de um subsistema do SW-USS, a mesma informada para ele em `GET /versioning/versions`.
+
+        - **Nomes:** os `system_identity` dos subsistemas são escolhidos pela empresa (ver o schema `SystemBoundaryIdentifier`). Mantenha o mesmo nome para o mesmo subsistema de uma versão do SW-USS para outra.
+        - **Para que serve:** o DECEA compara as versões dos subsistemas entre uma versão do SW-USS e outra para ver o que mudou e avaliar se a mudança é pequena ou grande. Por isso, informar os subsistemas é recomendado.
+
+        Responda `404` a um `system_identity` que não esteja na listagem. Este endpoint é obrigatório, inclusive em produção, mesmo que o SW-USS não informe subsistemas.
+      operationId: GetVersion
+      tags:
+      - Versioning
+components:
+  securitySchemes:
+    Authority:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: /token
+          scopes:
+            interuss.flight_planning.direct_automated_test: |-
+              O cliente pode verificar se o SW-USS está pronto para os testes e instruir o SW-USS ou o seu administrador a preparar os testes de planejamento de voo (atuando como diretor de testes).
+            interuss.flight_planning.plan: |-
+              O cliente pode instruir um usuário virtual a planejar um voo, alterar ou encerrar um plano de voo existente, e consultar o que o usuário virtual observou nessas tarefas.
+            interuss.versioning.read_system_versions: |-
+              O cliente pode ler as versões do software do SW-USS instaladas neste ambiente.
+            rid.inject_test_data: >-
+              O cliente pode injetar dados de teste em um Service Provider para fazer testes automatizados.
+      description: |
+        Token de acesso JWT emitido pelo Auth Server do BR-UTM em `GET /token` (ver `token.yaml`). O tipo `oauth2` é usado aqui só para declarar os escopos de cada operação: o BR-UTM não usa o fluxo OAuth *client credentials*.
+
+        Quem chama envia o token no header `Authorization: Bearer <token>`. O seu SW-USS deve verificar a assinatura RS256 com o JWKS do Auth Server, `iss` igual a `ICEA`, `aud` igual ao domínio do seu SW-USS, `exp` no futuro e o escopo exigido pela operação.
+
+  schemas:
+    FlightPlanID:
+      description: >-
+        Texto que identifica um plano de voo do usuário, no formato UUID versão 4 (RFC 4122).
+      maxLength: 36
+      minLength: 36
+      type: string
+      format: uuid
+      pattern: >-
+        ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$
+      example: 03e5572a-f733-49af-bc14-8a18bd53ee39
+
+    StatusResponse:
+      type: object
+      required:
+      - status
+      properties:
+        status:
+          description: |
+            Estado desta interface de teste.
+            - `Starting`: a interface está iniciando, e o condutor dos testes deve esperar antes de enviar requisições.
+            - `Ready`: a interface está pronta para receber requisições de teste.
+          type: string
+          enum: [Starting, Ready]
+          example: Ready
+        api_name:
+          description: |-
+            Indica a API implementada nesta URL. Deve ser "Flight Planning Automated Testing Interface".
+          type: string
+          example: Flight Planning Automated Testing Interface
+        api_version:
+          description: |-
+            Indica a versão da API implementada nesta URL. Deve ser "v0.7.0" ao implementar esta versão.
+          type: string
+          example: v0.7.0
+
+    FlightPlan:
+      description: >-
+        Detalhes da intenção do usuário de criar ou alterar um plano de voo.
+      required:
+      - basic_information
+      type: object
+      properties:
+        basic_information:
+          $ref: '#/components/schemas/BasicFlightPlanInformation'
+        uas:
+          $ref: '#/components/schemas/UASInformation'
+        operator:
+          $ref: '#/components/schemas/OperatorInformation'
+        telemetry:
+          description: |
+            Telemetria do voo (ver `FlightTelemetry`).
+
+            Se o voo for cancelado ou encerrado, a telemetria ainda não entregue ao sistema deve ser descartada.
+
+            Quando um plano de voo é alterado, a telemetria na fila é substituída pela alteração. Assim, se um plano que tinha telemetria for alterado para não ter nenhuma, todos os `AircraftState` na fila e não enviados devem ser descartados. Se a alteração não trouxer os `id` de um ou mais `AircraftState` já informados, eles devem ser descartados. Se trouxer `id` novos, eles devem entrar na fila. Uma alteração nunca deve mudar os dados de um `AircraftState` já na fila com um mesmo ID; se mudar, a requisição é inválida. Tentativas de criar, alterar ou remover um `AircraftState` já enviado, ou que já deveria ter sido enviado, devem ser ignoradas.
+          $ref: '#/components/schemas/FlightTelemetry'
+        astm_f3548_21:
+          $ref: '#/components/schemas/ASTMF354821OpIntentInformation'
+        additional_information:
+          description: >-
+            Informações relevantes para uma jurisdição ou caso de uso específico que não estão no schema padrão. Chaves e valores devem ser combinados entre quem projeta e quem participa dos testes.
+          type: object
+
+    BasicFlightPlanInformation:
+      description: >-
+        Informações básicas de um plano de voo que um usuário e/ou UAS costuma fornecer na maioria dos cenários.
+      type: object
+      required:
+      - usage_state
+      properties:
+        usage_state:
+          description: |
+            Uso atual do plano de voo pelo usuário.
+            `Planned`: o usuário pretende voar segundo este plano, mas ainda não está usando a área com um UAS ativo.
+
+            `InUse`: o usuário está usando a área com um UAS ativo.
+            `Closed`: o usuário não está mais usando nem pretende usar o plano de voo.
+          type: string
+          enum:
+          - Planned
+          - InUse
+          - Closed
+        uas_state:
+          description: |
+            Estado do UAS do usuário associado a este plano, informado pelo operador. Se o próprio UAS informar o seu estado, isso aparece na telemetria; se o operador informar, aparece aqui.
+            Se um sistema aceita informações de estado tanto do operador quanto do UAS, as duas podem divergir.
+          anyOf:
+          - $ref: '#/components/schemas/FunctionalState'
+        area:
+          description: |
+            A área completa em que o usuário pretende ou pode voar, segundo o que ele sabe. O usuário pretende ou pode voar em qualquer ponto dessa área.
+            Isso significa, por exemplo, que a operational intent ASTM F3548-21 que suporta este voo deve ter volumes que contenham esta área. Se a operational intent não cobrisse a área toda, parte do voo pretendido ficaria fora dela.
+          type: array
+          items:
+            $ref: '#/components/schemas/Volume4D'
+          default: []
+        description:
+          description: Texto livre em que o operador pode descrever a finalidade do voo, se quiser.
+          type: string
+          example: Medical supplies delivery operated by Example Drone Company
+          default: ''
+        utm_id:
+          description: ID universalmente único fornecido pelo UTM, rastreável até um ID não ofuscado, que funciona como um "ID de sessão" para proteger informações operacionalmente sensíveis.
+          type: string
+          example: ae1fa066-6d68-4018-8274-af867966978e
+          default: ''
+        specific_session_id:
+          $ref: '#/components/schemas/SpecificSessionID'
+
+    SpecificSessionID:
+      description: |-
+        ID único que identifica um voo específico (sessão) dando mais privacidade ao operador. Definido, por exemplo, na ASTM F3411.
+      type: string
+      example: 02-a1b2c3d4e5f60708
+      default: ''
+
+    ExecutionStyle:
+      type: string
+      description: |
+        Forma de execução da ação de planejamento que o operador quer que o SW-USS realize.
+
+        - `Hypothetical`: o usuário não quer que o SW-USS execute nada no plano de voo real; quer saber o resultado provável se a ação fosse tentada. A resposta se refere a um plano de voo, ou a uma mudança de estado, hipotéticos.
+        - `IfAllowed`: o usuário quer executar a ação se ela for permitida. Se for, o SW-USS deve executá-la (por exemplo, criar de fato uma operational intent ASTM F3548-21). Se não for, deve indicar `Rejected` e não executar. A resposta se refere a um plano de voo real quando cabível, nunca a um hipotético.
+        - `InReality`: o usuário está informando algo que já está acontecendo. O SW-USS deve considerar que o usuário está de fato fazendo (ou tentando fazer) esta ação, seja ela permitida ou não pelas regras do UTM.
+      enum: [Hypothetical, IfAllowed, InReality]
+      example: IfAllowed
+
+    UpsertFlightPlanRequest:
+      description: >-
+        Pedido do cliente para emular um usuário fazendo uma ação de planejamento de voo.
+      type: object
+      required:
+      - flight_plan
+      - execution_style
+      - request_id
+      properties:
+        flight_plan:
+          description: Informações completas, novas ou atualizadas, do voo, que descrevem a ação de planejamento a executar.
+          anyOf:
+          - $ref: '#/components/schemas/FlightPlan'
+        execution_style:
+          description: Forma de execução da ação de planejamento pedida.
+          anyOf:
+          - $ref: '#/components/schemas/ExecutionStyle'
+        request_id:
+          type: string
+          example: 3c2a8e71-9b4f-4d6a-8e15-7f0b6c9d2a43
+          description: >-
+            ID único do pedido de criação ou alteração. Se chegarem outros pedidos com o mesmo `request_id`, devolva a resposta do primeiro, sem executar a ação de novo; se essa resposta não estiver mais disponível, responda `409`.
+
+    PlanningActivityResult:
+      type: string
+      description: |
+        Resultado de uma ação de planejamento de voo.
+
+        - `Completed`: o plano de voo do usuário foi atualizado conforme a situação que ele informou.
+        - `Rejected`: as mudanças pedidas não são permitidas pelas regras sob as quais o plano de voo é gerenciado. Um motivo possível é um conflito não permitido com outro voo antes da decolagem.
+        - `Failed`: o SW-USS não conseguiu autorizar ou atualizar o plano de voo por um problema nele ou em um sistema de que depende.
+        - `NotSupported`: a implementação do SW-USS não suporta a interação tentada. Por exemplo, o pedido é de um voo de alta prioridade e o SW-USS não gerencia voos de alta prioridade.
+      enum: [Completed, Rejected, Failed, NotSupported]
+      example: Completed
+
+    FlightPlanStatus:
+      type: string
+      description: |
+        Estado do plano de voo do usuário.
+
+        - `NotPlanned`: o SW-USS não criou um plano de voo autorizado para o usuário.
+        - `Planned`: o SW-USS criou um plano de voo autorizado, mas o usuário ainda não pode começar a voar (mesmo dentro do horário do plano).
+        - `OkToFly`: o plano de voo permite que o usuário voe normalmente dentro dos seus limites (inclusive de tempo).
+        - `OffNominal`: o plano de voo reflete as ações do usuário, mas não está em estado normal (por exemplo, o SW-USS passou a operational intent para `Nonconforming` ou `Contingent`).
+        - `Closed`: o SW-USS encerrou o plano de voo, que saiu do sistema UTM.
+      enum: [NotPlanned, Planned, OkToFly, OffNominal, Closed]
+      example: Planned
+
+    AdvisoryInclusion:
+      type: string
+      description: |
+        Indica se o usuário recebeu avisos ou condições junto com o resultado da tentativa de planejamento.
+
+        - `Unknown`: não se sabe, ou não importa, se o usuário recebeu avisos ou condições.
+        - `AtLeastOneAdvisoryOrCondition`: o usuário recebeu pelo menos um aviso ou condição.
+        - `NoAdvisoriesOrConditions`: o usuário não recebeu avisos nem condições.
+      enum: [Unknown, AtLeastOneAdvisoryOrCondition, NoAdvisoriesOrConditions]
+      default: Unknown
+      example: NoAdvisoriesOrConditions
+
+    UpsertFlightPlanResponse:
+      type: object
+      required:
+      - planning_result
+      - flight_plan_status
+      properties:
+        planning_result:
+          description: >-
+            Resultado da tentativa de criar ou alterar o plano de voo feita pelo usuário emulado. Em qualquer resultado diferente de `Completed`, preencha `notes` com o motivo.
+          anyOf:
+          - $ref: '#/components/schemas/PlanningActivityResult'
+        notes:
+          description: >-
+            Explicação legível do resultado observado. Pode ser mostrada a quem analisa os resultados dos testes e, de preferência, deve explicar por que um resultado indesejado aconteceu. Por exemplo, se a injeção falhou (`Failed`), as notas podem dizer que o DSS respondeu 400 a uma requisição válida (talvez incluindo a requisição como prova).
+          type: string
+          example: Requested flight intersected operational intent c036326c-c97b-4926-bf9f-c60dc83d2b57
+        flight_plan_status:
+          description: >-
+            Estado do plano de voo do usuário depois da ação de planejamento.
+          anyOf:
+          - $ref: '#/components/schemas/FlightPlanStatus'
+        as_planned:
+          description: >-
+            O plano de voo como foi de fato planejado no sistema. Quando o SW-USS altera alguma informação pedida (por exemplo, o número de série, a telemetria, ou não injeta a telemetria), este campo deve conter todas essas alterações. Se ele não vier preenchido, o SW-USS indica que as informações foram injetadas sem alteração.
+          anyOf:
+          - $ref: '#/components/schemas/FlightPlan'
+        includes_advisories:
+          description: >-
+            Natureza dos avisos dados ao usuário na resposta à tentativa de realizar esta ação de planejamento.
+          anyOf:
+          - $ref: '#/components/schemas/AdvisoryInclusion'
+
+    DeleteFlightPlanResponse:
+      type: object
+      required:
+      - planning_result
+      - flight_plan_status
+      properties:
+        planning_result:
+          description: >-
+            Resultado da tentativa de cancelar ou encerrar o plano de voo feita pelo administrador do SW-USS. Em qualquer resultado diferente de `Completed`, preencha `notes` com o motivo.
+          anyOf:
+          - $ref: '#/components/schemas/PlanningActivityResult'
+        notes:
+          description: >-
+            Explicação legível do resultado observado.
+          type: string
+          example: DSS was unreachable when attempting to delete operational intent reference
+        flight_plan_status:
+          description: >-
+            Estado do plano de voo do usuário depois da ação de planejamento.
+          anyOf:
+          - $ref: '#/components/schemas/FlightPlanStatus'
+        includes_advisories:
+          description: >-
+            Natureza dos avisos dados ao usuário na resposta à tentativa de cancelar ou encerrar o plano de voo.
+          anyOf:
+          - $ref: '#/components/schemas/AdvisoryInclusion'
+
+    ClearAreaRequest:
+      type: object
+      required:
+      - request_id
+      - extent
+      properties:
+        request_id:
+          description: >-
+            Texto único que identifica este pedido. Se chegar um segundo pedido com o mesmo ID, o SW-USS devolve a resposta do anterior, sem limpar a área de novo.
+          type: string
+          example: 5b7f9c2e-1d4a-4e8b-a6f3-0c9d2e7b4a51
+        extent:
+          description: >-
+            O administrador do SW-USS deve cancelar e remover todo plano de voo que gerencia e que intersecte, em qualquer parte, esta área.
+          anyOf:
+          - $ref: '#/components/schemas/Volume4D'
+    ClearAreaOutcome:
+      type: object
+      properties:
+        success:
+          description: >-
+            Verdadeiro se, e somente se, todos os planos de voo do SW-USS na área foram cancelados e removidos.
+          type: boolean
+          default: false
+        message:
+          description: >-
+            Se o administrador do SW-USS não conseguiu limpar a área toda, descreva o problema nesta mensagem.
+          type: string
+          example: >-
+            DSS at dss.example.com returned 500 when attempting to delete
+            operational intent 57e98b17-aefa-4eee-a376-5140e4a8385f
+        details:
+          description: Dados estruturados livres e opcionais, para complementar `message`.
+          type: object
+    ClearAreaResponse:
+      type: object
+      required:
+      - outcome
+      properties:
+        outcome:
+          $ref: '#/components/schemas/ClearAreaOutcome'
+
+    QueryUserNotificationsResponse:
+      type: object
+      description: Resposta à consulta das notificações observadas pelo usuário virtual.
+      required:
+      - user_notifications
+      properties:
+        user_notifications:
+          description: Lista das notificações observadas pelo usuário que se aplicam à consulta.
+          type: array
+          items:
+            $ref: '#/components/schemas/UserNotification'
+
+    UASInformation:
+      description: >-
+        Informações de um UAS que podem ser fornecidas em cenários de planejamento de voo.
+      type: object
+      properties:
+        aircraft_type:
+          anyOf:
+          - $ref: '#/components/schemas/UAType'
+          description: Tipo de aeronave do voo de teste injetado.
+        serial_number:
+          description: Em geral no formato de número de série CTA-2063-A.
+          type: string
+          example: INTCJ123-4567-890
+          default: ''
+        registration_numbers:
+          description: >-
+            Para cada autoridade em que este UAS está registrado, o número ou identificador atribuído a ele.
+          type: array
+          items:
+            $ref: '#/components/schemas/UASRegistrationNumber'
+          default: []
+
+    UAType:
+      description: |
+        O tipo de UA ajuda a inferir desempenho, velocidade e duração dos voos. Por exemplo, uma aeronave de asa fixa em geral só voa para a frente (ao contrário de um multirrotor).
+
+        `HybridLift` é uma aeronave de asa fixa que decola na vertical. `Helicopter` inclui multirrotores.
+
+        `VTOL` equivale a `HybridLift`.
+      enum:
+      - NotDeclared
+      - Aeroplane
+      - Helicopter
+      - Gyroplane
+      - VTOL
+      - HybridLift
+      - Ornithopter
+      - Glider
+      - Kite
+      - FreeBalloon
+      - CaptiveBalloon
+      - Airship
+      - FreeFallOrParachute
+      - Rocket
+      - TetheredPoweredAircraft
+      - GroundObstacle
+      - Other
+      type: string
+      default: NotDeclared
+
+    UASRegistrationNumber:
+      description: >-
+        Número fornecido pela autoridade de aviação civil, ou representante autorizado, para registrar e/ou identificar UAS.
+      type: object
+      required:
+      - identifier
+      properties:
+        authority:
+          description: |-
+            Autoridade que forneceu este número de registro. Se a autoridade representar um país, recomenda-se a marca de nacionalidade ICAO.
+          type: string
+          example: N
+          default: ''
+        identifier:
+          description: |-
+            Número ou identificador atribuído pela autoridade.
+          type: string
+          example: N.123456
+
+    OperatorInformation:
+      description: >-
+        Informações do operador que podem ser fornecidas em cenários de planejamento de voo.
+      type: object
+      properties:
+        registration_numbers:
+          description: Números de registro do piloto remoto ou do operador.
+          type: array
+          items:
+            $ref: '#/components/schemas/OperatorRegistrationNumber'
+        location:
+          anyOf:
+          - $ref: '#/components/schemas/LatLngPoint'
+          description: Localização do operador.
+        altitude:
+          anyOf:
+          - $ref: '#/components/schemas/Altitude'
+          description: Altitude do operador.
+
+    OperatorRegistrationNumber:
+      description: >-
+        Número fornecido pela autoridade de aviação civil, ou representante autorizado, para registrar, licenciar e/ou identificar um piloto remoto ou operador.
+      type: object
+      required:
+      - identifier
+      properties:
+        authority:
+          description: |-
+            Autoridade que forneceu este número de registro. Se a autoridade representar um país, recomenda-se a marca de nacionalidade ICAO.
+          type: string
+          example: N
+          default: ''
+        type:
+          description: |-
+            Tipo de licença, registro, identificador etc.
+          type: string
+          example: Part107License
+          default: ''
+        identifier:
+          description: |-
+            Número ou identificador atribuído pela autoridade.
+          type: string
+          example: N.123456
+    LatLngPoint:
+      description: Ponto na superfície da Terra.
+      required:
+      - lat
+      - lng
+      type: object
+      properties:
+        lng:
+          $ref: '#/components/schemas/Longitude'
+        lat:
+          $ref: '#/components/schemas/Latitude'
+    Longitude:
+      description: >-
+        Graus de longitude a leste do meridiano de Greenwich, em relação ao elipsoide WGS84.
+      minimum: -180
+      exclusiveMaximum: false
+      maximum: 180
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: -118.456
+    Latitude:
+      description: >-
+        Graus de latitude ao norte do equador, em relação ao elipsoide WGS84.
+      maximum: 90
+      exclusiveMaximum: false
+      minimum: -90
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: 34.123
+    Altitude:
+      type: object
+      required:
+      - value
+      - reference
+      - units
+      properties:
+        value:
+          description: >-
+            Valor numérico da altitude. Os valores mínimo e máximo servem como verificação de sanidade e podem ser revistos à medida que novas unidades ou referenciais forem permitidos.
+          type: number
+          format: double
+          minimum: -8000
+          exclusiveMinimum: false
+          maximum: 100000
+          exclusiveMaximum: false
+        reference:
+          description: >-
+            Código do referencial da distância vertical. Ver AIXM 5.1 e FIXM 4.2.0 para W84 e SFC.
+          type: string
+          enum:
+          - W84
+          - SFC
+          - Takeoff
+        units:
+          description: >-
+            Unidade usada para expressar a altitude. Ver FIXM 4.2. Hoje o UTM só aceita metros, sem planos imediatos de aceitar outras.
+          type: string
+          enum:
+          - M
+    FlightTelemetry:
+      description: >-
+        Quando esta informação vier e o SW-USS aceitar telemetria para o voo, o SW-USS deve colocar estas posições na fila para entregá-las ao sistema, como se viessem do usuário, nos instantes indicados (ou logo depois).
+      type: object
+      properties:
+        states:
+          description: >-
+            Conjunto de dados de telemetria a injetar no sistema (como se informados pelo usuário ou pelo sistema dele) nos instantes adequados, e não antes, para este voo.
+          type: array
+          items:
+            $ref: '#/components/schemas/AircraftState'
+          default: []
+    AircraftState:
+      description: Estado de uma aeronave, para simular a execução de um plano de voo.
+      required:
+      - id
+      - timestamp
+      type: object
+      properties:
+        id:
+          description: >-
+            Identificador único deste estado (telemetria) da aeronave. O conteúdo de um `AircraftState` com um dado ID não muda com o tempo. Por isso, se o SW-USS já colocou na fila um estado com este ID, ignore este.
+          type: string
+          example: estado-0001
+        timestamp:
+          description: >-
+            Instante em que este estado é válido. Equivale ao momento da medição do sensor, então o sistema em teste não deve tomar conhecimento deste estado antes desse instante.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        timestamp_accuracy:
+          description: >-
+            Declaração da precisão do `timestamp`: metade da largura do intervalo de 95% de confiança em torno do `timestamp` para o momento real de validade de qualquer um dos campos.
+          type: number
+          format: float
+          minimum: 0.0
+          example: 1.0
+          default: 0.0
+        position:
+          $ref: '#/components/schemas/AircraftPosition'
+        operational_status:
+          $ref: '#/components/schemas/OperationalStatus'
+        uas_state:
+          description: |
+            Estado do UAS do usuário associado a este plano, informado pelo próprio UAS. Se o UAS informar o seu estado, isso aparece aqui; se o operador informar, aparece em `BasicFlightPlanInformation`.
+            Se um sistema aceita informações de estado tanto do operador quanto do UAS, as duas podem divergir.
+          anyOf:
+          - $ref: '#/components/schemas/FunctionalState'
+        track:
+          description: Direção do voo, expressa como ângulo de rumo verdadeiro em relação ao solo, em graus a leste do norte. O valor 360 indica que o valor real não está disponível.
+          type: number
+          format: float
+          maximum: 360.0
+          minimum: 0.0
+          example: 295.0
+          default: 0.0
+        speed:
+          description: Velocidade em relação ao solo, em metros por segundo.
+          type: number
+          format: float
+          minimum: 0.0
+          example: 1.9
+          default: 0.0
+        speed_accuracy:
+          description: Precisão da velocidade horizontal em relação ao solo.
+          anyOf:
+          - $ref: '#/components/schemas/SpeedAccuracy'
+        vertical_speed:
+          description: Velocidade vertical geodésica, para cima, em metros por segundo.
+          type: number
+          format: float
+          example: -0.2
+          default: 0.0
+    Time:
+      required:
+      - value
+      - format
+      type: object
+      properties:
+        value:
+          type: string
+          description: >-
+            Data e hora no formato RFC 3339. O fuso horário deve ser 'Z'.
+          format: date-time
+          example: '1985-04-12T23:20:50.52Z'
+        format:
+          type: string
+          enum:
+          - RFC3339
+
+    AircraftPosition:
+      description: >-
+        Posição informada ou real de uma aeronave em um dado instante.
+      type: object
+      properties:
+        location:
+          $ref: '#/components/schemas/LatLngPoint'
+        altitudes:
+          description: >-
+            A posição vertical da aeronave, possivelmente informada em relação a vários referenciais.
+          type: array
+          items:
+            $ref: '#/components/schemas/Altitude'
+        accuracy_h:
+          anyOf:
+          - $ref: '#/components/schemas/HorizontalAccuracy'
+          description: Erro horizontal possível da posição informada.
+        accuracy_v:
+          anyOf:
+          - $ref: '#/components/schemas/VerticalAccuracy'
+          description: Erro vertical possível da posição informada.
+        pressure_altitude:
+          description: Altitude não corrigida (com base na referência padrão de 29,92 inHg, 1013,25 mb), usada por algoritmos que trabalham com "diferenças de altitude" entre aeronaves. Em metros.
+          type: number
+          format: float
+          example: 1500.0
+          default: 0.0
+    HorizontalAccuracy:
+      description: |
+        É a enumeração NACp do ADS-B, mais 1 m, para cobrir melhor a faixa de UAs.
+
+        `HAUnknown`: precisão horizontal desconhecida
+
+        `HA10NMPlus`: > 10 NM (18,52 km)
+
+        `HA10NM`: < 10 NM (18,52 km)
+
+        `HA4NM`: < 4 NM (7,408 km)
+
+        `HA2NM`: < 2 NM (3,704 km)
+
+        `HA1NM`: < 1 NM (1852 m)
+
+        `HA05NM`: < 0,5 NM (926 m)
+
+        `HA03NM`: < 0,3 NM (555,6 m)
+
+        `HA01NM`: < 0,1 NM (185,2 m)
+
+        `HA005NM`: < 0,05 NM (92,6 m)
+
+        `HA30m`: < 30 m
+
+        `HA10m`: < 10 m
+
+        `HA3m`: < 3 m
+
+        `HA1m`: < 1 m
+      enum:
+      - HAUnknown
+      - HA10NMPlus
+      - HA10NM
+      - HA4NM
+      - HA2NM
+      - HA1NM
+      - HA05NM
+      - HA03NM
+      - HA01NM
+      - HA005NM
+      - HA30m
+      - HA10m
+      - HA3m
+      - HA1m
+      type: string
+    VerticalAccuracy:
+      description: |
+        É a enumeração GVA do ADS-B, com alguns valores mais finos para UAs.
+
+        `VAUnknown`: precisão vertical desconhecida
+
+        `VA150mPlus`: > 150 m
+
+        `VA150m`: < 150 m
+
+        `VA45m`: < 45 m
+
+        `VA25m`: < 25 m
+
+        `VA10m`: < 10 m
+
+        `VA3m`: < 3 m
+
+        `VA1m`: < 1 m
+      enum:
+      - VAUnknown
+      - VA150mPlus
+      - VA150m
+      - VA45m
+      - VA25m
+      - VA10m
+      - VA3m
+      - VA1m
+      type: string
+    OperationalStatus:
+      description: |
+        Status operacional da aeronave.
+        * `Undeclared`: o sistema não tem como saber o status da aeronave.
+        * `Ground`: a aeronave informa o status, mas não está no ar.
+        * `Airborne`: a aeronave está, ou deve ser considerada, no ar.
+        * `Emergency`: a aeronave informa uma emergência.
+        * `Unknown`: o sistema tem como saber o status da aeronave, mas no momento não consegue determiná-lo.
+      enum:
+      - Undeclared
+      - Ground
+      - Airborne
+      - Emergency
+      - Unknown
+      type: string
+      example: Airborne
+      default: Undeclared
+    FunctionalState:
+      description: |
+        Estado funcional do UAS do usuário associado a este plano de voo.
+
+        - `Nominal`: o usuário ou o UAS informa, ou dá a entender, que está operando normalmente, ou não indicou `OffNominal` nem `Contingent`.
+        - `OffNominal`: o usuário ou o UAS informa, ou dá a entender, que temporariamente não está operando normalmente, mas espera voltar à operação normal.
+        - `Contingent`: o usuário ou o UAS informa, ou dá a entender, que não está operando normalmente e pode não conseguir voltar à operação normal.
+        - `NotSpecified`: o estado do UAS não está disponível ou não é conhecido (por exemplo, o voo está planejado para o futuro e o UAS ainda não se conectou ao sistema).
+      type: string
+      enum:
+      - Nominal
+      - OffNominal
+      - Contingent
+      - NotSpecified
+    SpeedAccuracy:
+      description: |
+        Mesma escala e mesmos valores do NACv do ADS-B.
+
+        `SAUnknown`: precisão de velocidade desconhecida
+
+        `SA10mpsPlus`: > 10 m/s
+
+        `SA10mps`: < 10 m/s
+
+        `SA3mps`: < 3 m/s
+
+        `SA1mps`: < 1 m/s
+
+        `SA03mps`: < 0,3 m/s
+      enum:
+      - SAUnknown
+      - SA10mpsPlus
+      - SA10mps
+      - SA3mps
+      - SA1mps
+      - SA03mps
+      type: string
+    ASTMF354821OpIntentInformation:
+      description: >-
+        Informações de um plano de voo necessárias para a ASTM F3548-21.
+      type: object
+      properties:
+        priority:
+          $ref: '#/components/schemas/Priority'
+    Priority:
+      description: >-
+        Prioridade ordinal da operational intent, conforme a ASTM F3548-21.
+      type: integer
+      default: 0
+    Volume4D:
+      description: Bloco contínuo de espaço-tempo geográfico.
+      required:
+      - volume
+      type: object
+      properties:
+        volume:
+          $ref: '#/components/schemas/Volume3D'
+        time_start:
+          description: Início do volume. Deve ser anterior a `time_end`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: Fim do volume. Deve ser posterior a `time_start`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+    Volume3D:
+      description: >-
+        Volume geográfico tridimensional formado pela extrusão vertical de uma forma. Deve ser informado exatamente um contorno.
+      type: object
+      properties:
+        outline_circle:
+          anyOf:
+          - $ref: '#/components/schemas/Circle'
+          description: Forma geográfica circular na superfície da Terra.
+        outline_polygon:
+          anyOf:
+          - $ref: '#/components/schemas/Polygon'
+          description: >-
+            Forma geográfica poligonal na superfície da Terra.
+        altitude_lower:
+          description: >-
+            Altitude mínima do volume. Se informada, deve ser menor que `altitude_upper`.
+          anyOf:
+          - $ref: '#/components/schemas/Altitude'
+        altitude_upper:
+          description: >-
+            Altitude máxima do volume. Se informada, deve ser maior que `altitude_lower`.
+          anyOf:
+          - $ref: '#/components/schemas/Altitude'
+    Circle:
+      description: Área circular na superfície da Terra.
+      type: object
+      properties:
+        center:
+          $ref: '#/components/schemas/LatLngPoint'
+        radius:
+          $ref: '#/components/schemas/Radius'
+    Radius:
+      required:
+      - value
+      - units
+      type: object
+      properties:
+        value:
+          format: float
+          description: >-
+            Distância a partir do centro de uma área circular, sobre o elipsoide WGS84.
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+          example: 300.183
+        units:
+          type: string
+          description: >-
+            Unidades compatíveis com FIXM. No UTM, só metros ("M") são aceitos.
+          enum:
+          - M
+    Polygon:
+      description: >-
+        Área fechada sobre a Terra. As arestas do polígono são os caminhos mais curtos entre vértices consecutivos. Isso significa, por exemplo, que a aresta entre dois pontos de mesma latitude em geral não fica sobre essa latitude. A ordem dos vértices deve ser interpretada como a que produz a menor área. As arestas não podem se cruzar e os vértices não podem se repetir; em particular, o último vértice não pode ser igual ao primeiro.
+      required:
+      - vertices
+      type: object
+      properties:
+        vertices:
+          minItems: 3
+          type: array
+          items:
+            $ref: '#/components/schemas/LatLngPoint'
+    UserNotification:
+      type: object
+      description: Notificação observada pelo usuário virtual.
+      required:
+      - observed_at
+      properties:
+        observed_at:
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+          description: Momento em que o usuário virtual observou a notificação.
+        message:
+          description: Mensagem mostrada ao usuário, descrição da notificação ou outro meio de identificar a natureza da notificação, para tornar os relatórios de teste mais legíveis.
+          type: string
+          example: 'Conflito com outra operação na área: o voo não pode ser planejado.'
+        conflicts:
+          description: |
+            Situação de conflito indicada na notificação.
+            - `Unknown`: a notificação não traz informação sobre conflitos.
+            - `None`: a notificação indica que não há conflitos.
+            - `Single`: a notificação indica um conflito.
+            - `Multiple`: a notificação indica vários conflitos.
+          type: string
+          enum:
+          - Unknown
+          - None
+          - Single
+          - Multiple
+          default: Unknown
+    RIDAuthData:
+      description: Dados adicionais de autenticação.
+      type: object
+      properties:
+        format:
+          description: |
+            Formato dos dados adicionais de autenticação.
+
+            0: Nenhum
+            1: Assinatura do UAS ID
+            2: Assinatura do Operator ID
+            3: Assinatura do conjunto de mensagens
+            4: Autenticação fornecida pelo Remote ID em rede
+            5: Método específico
+            6-9: Reservados para a norma
+            10-15: Disponíveis para uso privado
+          type: integer
+          default: 0
+          minimum: 0
+          exclusiveMinimum: false
+          maximum: 15
+          exclusiveMaximum: false
+        data:
+          description: Dados de autenticação, no formato indicado em `format`.
+          type: string
+          default: ''
+    RIDAircraftPosition:
+      description: |
+        Posição de uma aeronave informada para fins de Remote ID.
+        Os campos `lat`, `lng` e `alt` são necessários para uma injeção bem-sucedida, mas não estão em `required` para que o BR-UTM Lab possa verificar o comportamento do Service Provider quando um UAS em rede não fornece os dados necessários para participar do Remote ID em rede.
+      type: object
+      properties:
+        lat:
+          $ref: '#/components/schemas/Latitude'
+        lng:
+          $ref: '#/components/schemas/RidLongitude'
+        alt:
+          $ref: '#/components/schemas/RidAltitude'
+        height:
+          $ref: '#/components/schemas/RIDHeight'
+        accuracy_h:
+          anyOf:
+          - $ref: '#/components/schemas/RidHorizontalAccuracy'
+          description: Erro horizontal provável da posição informada. Obrigatório quando `extrapolated` é verdadeiro e sempre na entrada do estado atual.
+        accuracy_v:
+          anyOf:
+          - $ref: '#/components/schemas/RidVerticalAccuracy'
+          description: Erro vertical provável da posição informada. Obrigatório quando `extrapolated` é verdadeiro e sempre na entrada do estado atual.
+        extrapolated:
+          description: Verdadeiro se esta posição foi gerada principalmente por cálculo, e não por medição direta de um instrumento. Se não for informado, vale falso.
+          type: boolean
+        pressure_altitude:
+          format: float
+          description: Altitude não corrigida (com base na referência padrão de 29,92 inHg, 1013,25 mb), usada por algoritmos que trabalham com "diferenças de altitude" entre aeronaves. Em metros, com resolução mínima de 1 metro.
+          type: number
+    RIDFlightDetails:
+      description: Detalhes de um voo informados por um Service Provider do Remote ID. Pelo menos um dos campos de registro ou de número de série deve ser preenchido, se a autoridade exigir.
+      required:
+      - id
+      type: object
+      properties:
+        id:
+          description: ID deste voo, igual ao do argumento da requisição.
+          type: string
+          example: a3423b-213401-0023
+        operator_id:
+          $ref: '#/components/schemas/OperatorId'
+        operator_location:
+          anyOf:
+          - $ref: '#/components/schemas/RidLatLngPoint'
+          description: Localização de quem controla a aeronave.
+        operation_description:
+          description: Texto livre em que o operador pode descrever a finalidade do voo, se quiser.
+          type: string
+          example: SafeFlightDrone company doing survey with DJI Inspire 2. See my privacy policy www.example.com/privacy.
+        auth_data:
+          $ref: '#/components/schemas/RIDAuthData'
+        serial_number:
+          description: Campo DESCONTINUADO, que será removido numa versão futura; use `uas_id.serial_number`. Pode ser informado quando não há ID de registro e a lei da região exige. No formato de número de série físico ANSI/CTA-2063-A.
+          type: string
+          example: INTCJ123-4567-890
+        registration_number:
+          description: Campo DESCONTINUADO, que será removido numa versão futura; use `uas_id.registration_number`. Se a autoridade de aviação civil tiver um método de registro de UAS, este número é fornecido por ela ou por representante autorizado. Obrigatório quando a lei da região exige.
+          type: string
+          example: FA12345897
+        uas_id:
+          $ref: '#/components/schemas/UASID'
+        operator_altitude:
+          $ref: '#/components/schemas/OperatorAltitude'
+    RIDAircraftState:
+      description: |
+        Estado de uma aeronave para fins de Remote ID.
+        Os campos `timestamp`, `timestamp_accuracy`, `accuracy_h`, `accuracy_v`, `speed`, `vertical_speed`, `track`, `speed_accuracy` e `position` são necessários para uma injeção bem-sucedida, mas não estão em `required` para que o BR-UTM Lab possa verificar o comportamento do Service Provider quando um UAS em rede não fornece os dados necessários para participar do Remote ID em rede.
+      type: object
+      properties:
+        timestamp:
+          format: date-time
+          description: Momento em que este estado era válido. Pode ser o horário da fonte, como um GPS, ou o momento em que o sistema calcula os valores com um algoritmo como um filtro de Kalman estendido (EKF). Deve ter resolução mínima de 1/10 de segundo. Formato RFC 3339, conforme a especificação OpenAPI.
+          type: string
+          example: '2026-11-05T14:05:00Z'
+        timestamp_accuracy:
+          $ref: '#/components/schemas/TimestampAccuracy'
+        operational_status:
+          $ref: '#/components/schemas/RIDOperationalStatus'
+        position:
+          $ref: '#/components/schemas/RIDAircraftPosition'
+        track:
+          $ref: '#/components/schemas/RIDTrack'
+        speed:
+          $ref: '#/components/schemas/RIDSpeed'
+        speed_accuracy:
+          anyOf:
+          - $ref: '#/components/schemas/RidSpeedAccuracy'
+          description: Precisão da velocidade horizontal em relação ao solo.
+        vertical_speed:
+          $ref: '#/components/schemas/VerticalSpeed'
+        height:
+          $ref: '#/components/schemas/RIDHeight'
+        group_radius:
+          format: float
+          description: Maior distância horizontal, em metros, entre a posição informada do grupo e qualquer aeronave do grupo. Contém o dado "Operating Area Radius" do dicionário de dados comum, quando a área de operação do grupo é dada por ponto e raio.
+          minimum: 0
+          exclusiveMinimum: true
+          type: number
+        group_ceiling:
+          format: float
+          description: Altitude máxima (metros, WGS84-HAE) da operação em grupo. Contém o dado "Operating Area Ceiling" do dicionário de dados comum, quando a área de operação do grupo é dada por ponto e raio.
+          type: number
+        group_floor:
+          format: float
+          description: Altitude mínima (metros, WGS84-HAE) da operação em grupo. Se não for informada, considera-se o nível do solo. Contém o dado "Operating Area Floor" do dicionário de dados comum, quando a área de operação do grupo é dada por ponto e raio.
+          type: number
+        group_count:
+          format: int32
+          description: Ao operar um grupo (formação ou enxame), o número de aeronaves no grupo. Contém o dado "Operating Area Count" do dicionário de dados comum, quando a área de operação do grupo é dada por ponto e raio.
+          minimum: 1
+          exclusiveMinimum: false
+          type: integer
+        group_time_start:
+          format: date-time
+          description: Momento em que a operação em grupo começa. Contém o dado "Operation Area Start" do dicionário de dados comum, quando a área de operação do grupo é dada por ponto e raio.
+          type: string
+          example: '2026-11-05T14:00:00Z'
+        group_time_end:
+          format: date-time
+          description: Momento em que a operação em grupo termina. Contém o dado "Operation Area End" do dicionário de dados comum, quando a área de operação do grupo é dada por ponto e raio.
+          type: string
+          example: '2026-11-05T14:30:00Z'
+    RidSpecificSessionID:
+      description: |
+        ID único de 20 bytes que identifica um voo específico (sessão) dando mais privacidade ao operador. O primeiro byte é o tipo de Specific Session ID registrado, mantido por um registrador (ver o Anexo A5), e os 19 bytes restantes são o ID da sessão, conforme a especificação desse tipo.
+
+        Registros iniciais:
+
+        0 – reservado
+        1 – ID de entidade do Drone Remote Identification Protocol (DRIP) da IETF
+        2 – HashedID8 da IEEE 1609.2
+
+        Expresso como texto hexadecimal dos bytes. Quem recebe deve ignorar hífens. Se houver menos de 20 bytes, os bytes restantes no fim valem 0.
+      type: string
+      example: 02-a1b2c3d4e5f60708
+      default: ''
+    UASID:
+      description: Identificação do UAS que faz este voo. Pelo menos um campo deste objeto deve ser informado.
+      type: object
+      properties:
+        serial_number:
+          description: No formato de número de série CTA-2063-A.
+          type: string
+          example: INTCJ123-4567-890
+          default: ''
+        registration_id:
+          description: Se a autoridade de aviação civil tiver um método de registro de UAS, este número é fornecido por ela ou por representante autorizado. Formato `<marca de nacionalidade ICAO>.<ID atribuído pela autoridade>`, em ASCII, só com letras maiúsculas (A-Z), ponto (.) e dígitos (0-9). O exemplo é válido para os EUA.
+          type: string
+          example: N.123456
+          default: ''
+        utm_id:
+          description: ID universalmente único fornecido pelo UTM, rastreável até um ID não ofuscado, que funciona como um "ID de sessão" para proteger informações operacionalmente sensíveis.
+          type: string
+          example: ae1fa066-6d68-4018-8274-af867966978e
+          default: ''
+        specific_session_id:
+          $ref: '#/components/schemas/RidSpecificSessionID'
+
+    CreateTestParameters:
+      description: 'Conjunto completo de dados a injetar no Service Provider em teste.'
+      required:
+      - requested_flights
+      type: object
+      properties:
+        requested_flights:
+          description: >-
+            Um ou mais voos lógicos, cada um com dados de teste a injetar no sistema. Os itens devem estar em ordem crescente de `timestamp`.
+          type: array
+          items:
+            $ref: '#/components/schemas/TestFlight'
+    ChangeTestResponse:
+      description: ''
+      required:
+      - injected_flights
+      - version
+      type: object
+      properties:
+        injected_flights:
+          description: 'O conjunto completo de dados de teste efetivamente injetados no Service Provider em teste.'
+          type: array
+          items:
+            $ref: '#/components/schemas/TestFlight'
+        version:
+          description: Versão do teste. Usada para remover o teste.
+          type: string
+          example: '1.0.0'
+    DeleteTestResponse:
+      description: ''
+      required:
+      - injected_flights
+      type: object
+      properties:
+        injected_flights:
+          description: 'O conjunto completo de dados de teste removidos.'
+          type: array
+          items:
+            $ref: '#/components/schemas/TestFlight'
+    TestFlight:
+      description: "Dados a fornecer ao injetor de dados de teste de um Service Provider para um único voo."
+      required:
+      - injection_id
+      - telemetry
+      - details_responses
+      type: object
+      properties:
+        injection_id:
+          description: 'ID do voo de teste injetado. Não muda, qualquer que seja o ID de voo ou o ID UTM informado no sistema.'
+          type: string
+          example: 'edb7695f-8737-4b9f-91f8-e2afbb333f41'
+        aircraft_type:
+          anyOf:
+          - $ref: '#/components/schemas/RidUAType'
+          description: Tipo de aeronave do voo de teste injetado.
+        telemetry:
+          description: >-
+            Telemetria a injetar no sistema para este voo. Cada item segue o schema `RIDAircraftState` da norma de Remote ID da ASTM.
+          type: array
+          items:
+            $ref: '#/components/schemas/RIDAircraftState'
+        details_responses:
+          description: Detalhes do voo ao longo do tempo.
+          type: array
+          items:
+            $ref: '#/components/schemas/TestFlightDetails'
+    TestFlightDetails:
+      description: Dados com que o Service Provider em teste deve responder quando consultado sobre os detalhes de um voo de teste.
+      required:
+      - effective_after
+      - details
+      type: object
+      properties:
+        effective_after:
+          description: >-
+            Instante a partir do qual o Service Provider em teste deve responder com `details`, a menos que haja outros `details` com um `effective_after` mais recente (anterior ao momento atual).
+          type: string
+          example: '2026-11-05T14:00:00Z'
+          format: date-time
+        details:
+          description: >-
+            Detalhes do voo. Segue o schema `RIDFlightDetails` da norma de Remote ID da ASTM.
+          $ref: '#/components/schemas/RIDFlightDetails'
+    RidUserNotification:
+      type: object
+      description: Notificação observada pelo usuário virtual.
+      required:
+      - observed_at
+      properties:
+        observed_at:
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+          description: Momento em que o usuário virtual observou a notificação.
+        message:
+          description: Mensagem mostrada ao usuário, descrição da notificação ou outro meio de identificar a natureza da notificação, para tornar os relatórios de teste mais legíveis.
+          type: string
+          example: 'Perda de conexão com o drone: a telemetria do voo foi interrompida.'
+    RidQueryUserNotificationsResponse:
+      type: object
+      description: Resposta à consulta das notificações observadas pelo usuário virtual.
+      required:
+      - user_notifications
+      properties:
+        user_notifications:
+          description: Lista das notificações observadas pelo usuário que se aplicam à consulta.
+          type: array
+          items:
+            $ref: '#/components/schemas/RidUserNotification'
+
+    RidLongitude:
+      format: double
+      description: Graus de longitude a leste do meridiano de Greenwich, em relação ao elipsoide WGS84.
+      maximum: 180
+      exclusiveMaximum: false
+      minimum: -180
+      exclusiveMinimum: false
+      type: number
+      example: -118.456
+    RidAltitude:
+      format: float
+      description: Altitude, em metros, acima do elipsoide WGS84.
+      type: number
+      example: 1321.2
+    RIDHeight:
+      description: Altura relativa, para fins de Remote ID.
+      required:
+      - distance
+      - reference
+      type: object
+      properties:
+        distance:
+          format: float
+          description: Distância acima do referencial. Em metros, com resolução mínima de 1 metro.
+          type: number
+        reference:
+          description: Referencial acima do qual a altura é informada.
+          enum:
+          - TakeoffLocation
+          - GroundLevel
+          type: string
+    RidHorizontalAccuracy:
+      description: |
+        Baseado no NACp do ADS-B (mais um incremento).
+
+        `HAUnknown`: precisão horizontal desconhecida
+
+        `HA10NMPlus`: > 10 NM (18,52 km)
+
+        `HA10NM`: < 10 NM (18,52 km)
+
+        `HA4NM`: < 4 NM (7,408 km)
+
+        `HA2NM`: < 2 NM (3,704 km)
+
+        `HA1NM`: < 1 NM (1852 m)
+
+        `HA05NM`: < 0,5 NM (926 m)
+
+        `HA03NM`: < 0,3 NM (555,6 m)
+
+        `HA01NM`: < 0,1 NM (185,2 m)
+
+        `HA005NM`: < 0,05 NM (92,6 m)
+
+        `HA30m`: < 30 m
+
+        `HA10m`: < 10 m
+
+        `HA3m`: < 3 m
+
+        `HA1m`: < 1 m
+      enum:
+      - HAUnknown
+      - HA10NMPlus
+      - HA10NM
+      - HA4NM
+      - HA2NM
+      - HA1NM
+      - HA05NM
+      - HA03NM
+      - HA01NM
+      - HA005NM
+      - HA30m
+      - HA10m
+      - HA3m
+      - HA1m
+      type: string
+      default: HAUnknown
+    RidVerticalAccuracy:
+      description: |
+        Baseado na precisão vertical geodésica (GVA) do ADS-B (mais três incrementos).
+
+        `VAUnknown`: precisão vertical desconhecida
+
+        `VA150mPlus`: > 150 m
+
+        `VA150m`: < 150 m
+
+        `VA45m`: < 45 m
+
+        `VA25m`: < 25 m
+
+        `VA10m`: < 10 m
+
+        `VA3m`: < 3 m
+
+        `VA1m`: < 1 m
+      enum:
+      - VAUnknown
+      - VA150mPlus
+      - VA150m
+      - VA45m
+      - VA25m
+      - VA10m
+      - VA3m
+      - VA1m
+      type: string
+      default: VAUnknown
+    OperatorId:
+      description: >-
+        Identificação do operador. No Brasil, é o número de um documento de identificação do operador: CPF, RG, passaporte ou outro documento de identificação aceito no Brasil. É um dado pessoal.
+      type: string
+      example: '000.000.000-00'
+    RidLatLngPoint:
+      description: Ponto na superfície da Terra.
+      required:
+      - lat
+      - lng
+      type: object
+      properties:
+        lng:
+          $ref: '#/components/schemas/RidLongitude'
+        lat:
+          $ref: '#/components/schemas/Latitude'
+    OperatorAltitude:
+      description: Altitude do piloto remoto.
+      type: object
+      properties:
+        altitude:
+          $ref: "#/components/schemas/RidAltitude"
+        altitude_type:
+          description: Fonte do dado do campo de altitude.
+          type: string
+          enum:
+          - Takeoff
+          - Dynamic
+          - Fixed
+    TimestampAccuracy:
+      format: float
+      description: 'Declaração da precisão do `timestamp`: a maior diferença entre o `timestamp` e o momento real de validade de qualquer um destes campos: latitude, longitude, altitude geodésica, altitude de pressão e altura. Em segundos, com precisão de 1/10 de segundo. Corresponde ao limite de incerteza de 95% do `timestamp`.'
+      minimum: 0
+      exclusiveMinimum: false
+      type: number
+    RIDOperationalStatus:
+      description: Status operacional da aeronave.
+      enum:
+      - Undeclared
+      - Ground
+      - Airborne
+      - Emergency
+      - RemoteIDSystemFailure
+      type: string
+    RIDTrack:
+      format: float
+      description: Direção do voo, expressa como ângulo de rumo verdadeiro em relação ao solo, em graus a leste do norte, com resolução mínima de 1 grau.
+      maximum: 360
+      exclusiveMaximum: true
+      minimum: 0
+      exclusiveMinimum: false
+      type: number
+    RIDSpeed:
+      format: float
+      description: Velocidade em relação ao solo, em metros por segundo.
+      minimum: 0
+      exclusiveMinimum: false
+      type: number
+      example: 1.9
+    RidSpeedAccuracy:
+      description: |
+        Qualidade (contenção) da velocidade horizontal em relação ao solo.
+
+        `SAUnknown`: precisão de velocidade desconhecida
+
+        `SA10mpsPlus`: > 10 m/s
+
+        `SA10mps`: < 10 m/s
+
+        `SA3mps`: < 3 m/s
+
+        `SA1mps`: < 1 m/s
+
+        `SA03mps`: < 0,3 m/s
+      enum:
+      - SAUnknown
+      - SA10mpsPlus
+      - SA10mps
+      - SA3mps
+      - SA1mps
+      - SA03mps
+      type: string
+      default: SAUnknown
+    VerticalSpeed:
+      format: float
+      description: Velocidade vertical (para cima), WGS84-HAE, em m/s.
+      type: number
+      example: 0.2
+    RidUAType:
+      description: |
+        O tipo de UA ajuda a inferir desempenho, velocidade e duração dos voos. Por exemplo, uma aeronave de asa fixa em geral só voa para a frente (ao contrário de um multirrotor). Também ajuda a diferenciar tipos de aeronave sem compartilhar informações operacionalmente sensíveis, como a marca e o modelo, que devem ficar disponíveis na consulta do registro. O tipo de UAS também ajuda a correlacionar a observação visual com os dados recebidos. Os tipos foram definidos com base em características de voo distintas.
+
+        `HybridLift` é uma aeronave de asa fixa que decola na vertical. `Helicopter` inclui multirrotores.
+
+        `VTOL` equivale a `HybridLift` e é mantido por compatibilidade com a F3411-v19.
+      enum:
+      - NotDeclared
+      - Aeroplane
+      - Helicopter
+      - Gyroplane
+      - VTOL
+      - HybridLift
+      - Ornithopter
+      - Glider
+      - Kite
+      - FreeBalloon
+      - CaptiveBalloon
+      - Airship
+      - FreeFallOrParachute
+      - Rocket
+      - TetheredPoweredAircraft
+      - GroundObstacle
+      - Other
+      type: string
+      default: NotDeclared
+    SystemBoundaryIdentifier:
+      type: string
+      description: |-
+        Identificador de um sistema para o qual esta interface informa uma versão.
+
+        - `sw-uss` é reservado: identifica o SW-USS como um todo, com a versão informada no Portal BR-UTM.
+        - Os demais identificam os subsistemas do SW-USS e são escolhidos pela empresa. Use nomes curtos e descritivos, que possam ser usados numa URL (letras minúsculas, dígitos, `-` e `.`), e mantenha o mesmo nome para o mesmo subsistema de uma versão para outra, para que o DECEA possa comparar as versões.
+      example: api-operational-intents
+
+    VersionIdentifier:
+      type: string
+      description: >-
+        Identificador de uma versão de um sistema. O formato não é prescrito, mas recomenda-se uma versão semântica (https://semver.org/) precedida de `v`.
+      example: v2.3.0
+
+    GetVersionResponse:
+      type: object
+      required:
+      - system_identity
+      - system_version
+      properties:
+        system_identity:
+          description: Identidade do sistema pedida.
+          anyOf:
+          - $ref: '#/components/schemas/SystemBoundaryIdentifier'
+        system_version:
+          description: Versão do sistema com a identidade pedida.
+          anyOf:
+          - $ref: '#/components/schemas/VersionIdentifier'
+
+    SystemVersion:
+      type: object
+      description: Versão de um sistema do SW-USS (`sw-uss` ou um subsistema).
+      required:
+      - system_identity
+      - system_version
+      properties:
+        system_identity:
+          $ref: '#/components/schemas/SystemBoundaryIdentifier'
+        system_version:
+          $ref: '#/components/schemas/VersionIdentifier'
+        description:
+          description: O que este sistema faz no SW-USS. Recomendado para os subsistemas.
+          type: string
+          example: API que responde os endpoints de operational intents e constraints
+
+    ListVersionsResponse:
+      type: object
+      description: Versão do SW-USS e versões dos seus subsistemas.
+      required:
+      - versions
+      properties:
+        versions:
+          description: Lista de versões. Sempre inclui o item com `system_identity` igual a `sw-uss`.
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/SystemVersion'

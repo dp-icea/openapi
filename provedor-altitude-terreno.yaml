@@ -1,0 +1,677 @@
+openapi: 3.0.2
+info:
+  title: Provedor de Altitude de Terreno
+  version: 1.0.0
+  description: |
+    Informa a altitude do terreno nos pontos cobertos pelos seus dados. O seu SW-USS **chama** este serviço; não o implementa. O Provedor de Altitude de Terreno (*Terrain Altitude Provider*) faz parte do ECO-UTM e é mantido pelo DECEA.
+
+    ## Para que serve
+
+    Os volumes das operational intents e das constraints usam altitudes absolutas (`reference: W84`), e não alturas acima do solo. Para que todos esses volumes fiquem na mesma referência vertical, o BR-UTM usa uma única fonte de altitude do terreno: este serviço.
+
+    - **Constraints de aeródromos.** O DECEA cria as constraints dos aeródromos a partir da altitude do terreno no aeródromo, obtida neste serviço, até 400 pés (121,92 m) acima dela.
+    - **Operational intents.** O SW-USS usa este serviço para obter a altitude do terreno da operação e planejar os volumes a partir dela. Assim, a operational intent não fica dentro do solo.
+
+    **Todos os volumes devem ser criados com a mesma informação de terreno: a deste serviço.**
+
+    ## Dados de terreno
+
+    - **Fonte:** Copernicus DEM GLO-30, um modelo digital de superfície (DSM) com resolução de 1 segundo de arco (cerca de 30 m). Por ser um modelo de superfície, a altitude pode incluir edificações e vegetação.
+    - **Referencial vertical:** os dados de origem estão em EGM2008 (altitude em relação ao geoide). O serviço devolve a altitude em `W84` (altitude elipsoidal, a mesma referência dos volumes do BR-UTM), somando à altitude EGM2008 a ondulação geoidal do modelo EGM2008 no ponto. A altitude EGM2008 continua disponível com `reference=EGM2008`. No Brasil, a diferença entre as duas referências vai de 5 a 30 m: nunca use um valor EGM2008 como se fosse `W84`.
+    - **Amostragem:** a altitude de um ponto é a do pixel que o contém, sem interpolação.
+    - **Unidade:** metros.
+    - **Cobertura:** só onde há dados carregados no serviço, em blocos de 1° × 1° (ver `GET /terrain/v1/coverage`). Fora deles, a consulta de um ponto responde `404`.
+
+    ## Como o seu SW-USS usa
+
+    1. **Obtenha a altitude do terreno de um ponto de referência da operação** em `GET /terrain/v1/elevation?lat=...&lng=...`. A resposta vem em `W84`, pronta para os volumes. Esse ponto de referência guia o planejamento da operational intent e a altura do drone durante a operação.
+    2. **Planeje os volumes a partir dessa altitude.** As altitudes dos volumes (`altitude_lower` e `altitude_upper`, em `W84`) são calculadas a partir da altitude do terreno no ponto de referência. Por exemplo, numa operação até 100 m acima de um ponto de referência com altitude do terreno de 754,5 m, o volume vai de 754,5 m a 854,5 m. Para converter uma altura acima do terreno (AGL) em altitude `W84` num ponto, use `POST /terrain/v1/altitude/convert`.
+    3. **Terreno irregular.** Se a altitude do terreno varia ao longo da operational intent, não há problema em uma parte dos volumes ficar um pouco dentro do solo. O que não pode acontecer é a operational intent ficar **inteiramente dentro do solo**: não seria possível voar nela, e ela ficaria fora das constraints, que estão acima do terreno, sem que a verificação de interseção com elas a detectasse. É isso que este serviço resolve.
+
+    O que o SW-USS deve fazer quando o serviço não tem dados de terreno para o ponto de referência (`404`) ainda não foi definido.
+
+    ## URL base e autenticação
+
+    Os caminhos deste arquivo ficam sob a URL base do API Gateway do ambiente (ver `servers`), como os do DSS. Chame com `Authorization: Bearer <token>`, um token obtido em `GET /token` (ver `token.yaml`) com:
+
+    - `intended_audience`: o domínio do Provedor de Altitude de Terreno, isto é, o host da URL base (ex.: `api.sandbox.brutm.icea.decea.mil.br`). Se o serviço estiver publicado em mais de um domínio, cada um deles é aceito como `aud`.
+    - `scope`: o token precisa conter `terrain.query`. Ele pode levar outros escopos, separados por espaço, junto com este.
+
+    Os erros vêm no corpo como `{"message": "..."}`.
+servers:
+- url: http://api.sandbox.brutm.icea.decea.mil.br
+  description: Desenvolvimento (somente HTTP, sem TLS)
+- url: https://eco-utm.decea.mil.br
+  description: Produção
+security:
+- Authority:
+  - terrain.query
+tags:
+- name: Altitude do terreno
+  description: Endpoints do Provedor de Altitude de Terreno que informam a altitude do terreno e convertem altitudes entre referenciais.
+paths:
+  /terrain/v1/elevation:
+    get:
+      tags:
+      - Altitude do terreno
+      security:
+      - Authority:
+        - terrain.query
+      summary: Obtém a altitude do terreno em um ponto ou em uma área
+      operationId: getTerrainElevation
+      description: |
+        **Escopo exigido no token de quem chama:** `terrain.query`
+
+        **Quem chama:** os SW-USS, para obter a altitude do terreno do ponto de referência da operação, e os Gerenciadores de Constraints do DECEA.
+
+        Funciona de duas formas, conforme os parâmetros:
+
+        - **Um ponto** (`lat` e `lng`): devolve a altitude do terreno no pixel que contém o ponto (`ElevationResponse`). É a forma usada para o ponto de referência da operação. Responde `404` se o ponto estiver fora da cobertura ou se o pixel não tiver dado.
+        - **Uma área** (`view`): devolve a altitude de todos os pixels do retângulo, cada um no seu centro (`AreaElevationResponse`). Pixels sem dado e partes do retângulo fora da cobertura são omitidos; um retângulo inteiramente fora da cobertura devolve `points` vazio e `count` igual a `0`. A ordem dos pontos não é garantida.
+
+        Envie `lat` e `lng`, ou `view`. Se `view` for enviado, `lat` e `lng` são ignorados.
+
+        A área de `view` é limitada a 5.000 km², calculada de forma aproximada a partir dos cantos. Cada pixel tem cerca de 30 m de lado, então uma área grande gera uma resposta muito grande (cerca de 1.100 pontos por km²): peça só a área de que precisa.
+
+        Por padrão, a altitude vem em `W84`, a referência dos volumes do BR-UTM. Com `reference=EGM2008`, vem em relação ao geoide.
+      parameters:
+      - name: lat
+        in: query
+        required: false
+        description: Latitude do ponto. Obrigatório com `lng` quando `view` não é enviado.
+        schema:
+          $ref: '#/components/schemas/Latitude'
+        example: -23.5505
+      - name: lng
+        in: query
+        required: false
+        description: Longitude do ponto. Obrigatório com `lat` quando `view` não é enviado.
+        schema:
+          $ref: '#/components/schemas/Longitude'
+        example: -46.6333
+      - name: view
+        in: query
+        required: false
+        description: >-
+          Retângulo dado por dois cantos opostos: `lat1,lng1,lat2,lng2`, em graus. Os cantos podem vir em qualquer ordem; a resposta devolve o retângulo normalizado. A área é limitada a 5.000 km².
+        schema:
+          type: string
+          pattern: >-
+            ^-?\d+(\.\d+)?,-?\d+(\.\d+)?,-?\d+(\.\d+)?,-?\d+(\.\d+)?$
+        example: '-23.5521,-46.6361,-23.5517,-46.6357'
+      - name: reference
+        in: query
+        required: false
+        description: >-
+          Referencial vertical da altitude devolvida. `W84` (padrão) é a referência dos volumes do BR-UTM.
+        schema:
+          $ref: '#/components/schemas/TerrainReference'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                oneOf:
+                - $ref: '#/components/schemas/ElevationResponse'
+                - $ref: '#/components/schemas/AreaElevationResponse'
+              examples:
+                ponto:
+                  summary: Altitude do terreno em um ponto de São Paulo, em W84 (valores ilustrativos)
+                  value:
+                    lat: -23.5505
+                    lng: -46.6333
+                    elevation: 754.5
+                    reference: W84
+                    units: m
+                pontoEgm2008:
+                  summary: O mesmo ponto com reference=EGM2008 (valores ilustrativos)
+                  value:
+                    lat: -23.5505
+                    lng: -46.6333
+                    elevation: 760.0
+                    reference: EGM2008
+                    units: m
+                area:
+                  summary: Área de 2 × 2 pixels (valores ilustrativos)
+                  value:
+                    view:
+                    - -23.5521
+                    - -46.6361
+                    - -23.5517
+                    - -46.6357
+                    points:
+                    - lat: -23.551806
+                      lng: -46.635972
+                      elevation: 753.4
+                    - lat: -23.551806
+                      lng: -46.635694
+                      elevation: 753.9
+                    - lat: -23.552083
+                      lng: -46.635972
+                      elevation: 752.1
+                    - lat: -23.552083
+                      lng: -46.635694
+                      elevation: 752.8
+                    reference: W84
+                    units: m
+                    count: 4
+          description: A altitude do terreno foi obtida com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                semParametros:
+                  summary: Nem lat e lng, nem view
+                  value:
+                    message: lat and lng query parameters are required.
+                foraDosLimites:
+                  summary: Coordenada fora dos limites
+                  value:
+                    message: lat must be [-90,90] and lng must be [-180,180].
+                viewInvalida:
+                  summary: view sem quatro coordenadas
+                  value:
+                    message: view must be lat1,lng1,lat2,lng2.
+                areaGrande:
+                  summary: Área maior que o limite
+                  value:
+                    message: area 6214.37 km² exceeds maximum of 5000 km².
+                referencia:
+                  summary: reference inválida
+                  value:
+                    message: "unsupported reference 'AGL'. Supported: W84, EGM2008."
+          description: >-
+            Um ou mais parâmetros estão ausentes ou inválidos, ou a área de `view` é maior que 5.000 km².
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                semToken:
+                  summary: Header Authorization ausente
+                  value:
+                    message: missing Authorization header.
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado, é inválido ou expirou.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                escopo:
+                  summary: Token sem o escopo exigido
+                  value:
+                    message: 'missing required scope: terrain.query.'
+          description: >-
+            O token de acesso foi decodificado, mas o `scope` não contém `terrain.query`.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                semCobertura:
+                  summary: Ponto fora da cobertura
+                  value:
+                    message: tile not available for (-10.500000, -30.200000).
+                semDado:
+                  summary: Pixel sem dado
+                  value:
+                    message: no data at (-23.550500, -46.633300).
+          description: >-
+            Consulta de um ponto: o ponto está fora da cobertura do serviço ou o pixel não tem dado. Não ocorre na consulta de uma área.
+  /terrain/v1/altitude/convert:
+    post:
+      tags:
+      - Altitude do terreno
+      security:
+      - Authority:
+        - terrain.query
+      summary: Converte uma altitude entre referenciais em um ponto
+      operationId: convertAltitude
+      description: |
+        **Escopo exigido no token de quem chama:** `terrain.query`
+
+        **Quem chama:** os SW-USS e os Gerenciadores de Constraints do DECEA, para converter alturas e altitudes em um ponto.
+
+        Converte uma altitude, em um ponto, entre três referenciais:
+
+        - `AGL`: altura acima do terreno deste serviço, no pixel que contém o ponto;
+        - `W84`: altitude elipsoidal (WGS84), a referência dos volumes do BR-UTM;
+        - `EGM2008`: altitude em relação ao geoide.
+
+        Qualquer conversão entre dois referenciais diferentes é aceita. A mais comum é `AGL` → `W84`: a altura planejada acima do ponto de referência vira a altitude `W84` dos volumes. As conversões que envolvem `AGL` usam a altitude do terreno no ponto, a mesma de `GET /terrain/v1/elevation`; `W84` ↔ `EGM2008` usa a ondulação geoidal do modelo EGM2008 no ponto.
+
+        - Responde `400` se `from.reference` e `to` forem iguais, se algum referencial não for aceito ou se `from.units` não for `m`.
+        - Responde `404` se o ponto estiver fora da cobertura ou se o pixel não tiver dado.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AltitudeConvertRequest'
+            examples:
+              aglParaW84:
+                summary: 100 m acima do terreno, convertidos para W84
+                value:
+                  lat: -23.5505
+                  lng: -46.6333
+                  from:
+                    value: 100.0
+                    reference: AGL
+                    units: m
+                  to: W84
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AltitudeConvertResponse'
+              examples:
+                aglParaW84:
+                  summary: 100 m AGL sobre um terreno com 754,5 m em W84 (valores ilustrativos)
+                  value:
+                    lat: -23.5505
+                    lng: -46.6333
+                    from:
+                      value: 100.0
+                      reference: AGL
+                      units: m
+                    result:
+                      value: 854.5
+                      reference: W84
+                      units: m
+          description: A altitude foi convertida com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                corpoInvalido:
+                  summary: Corpo que não é JSON válido
+                  value:
+                    message: invalid JSON body.
+                mesmoReferencial:
+                  summary: from.reference igual a to
+                  value:
+                    message: 'unsupported conversion: W84 -> W84.'
+                unidade:
+                  summary: Unidade diferente de metros
+                  value:
+                    message: "unsupported units 'ft'. Supported: m."
+          description: >-
+            O corpo é inválido, os referenciais são iguais ou não aceitos, ou a unidade não é `m`.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                semToken:
+                  summary: Header Authorization ausente
+                  value:
+                    message: missing Authorization header.
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado, é inválido ou expirou.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                escopo:
+                  summary: Token sem o escopo exigido
+                  value:
+                    message: 'missing required scope: terrain.query.'
+          description: >-
+            O token de acesso foi decodificado, mas o `scope` não contém `terrain.query`.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                semCobertura:
+                  summary: Ponto fora da cobertura
+                  value:
+                    message: tile not available for (-10.500000, -30.200000).
+          description: O ponto está fora da cobertura do serviço ou o pixel não tem dado.
+  /terrain/v1/coverage:
+    get:
+      tags:
+      - Altitude do terreno
+      security:
+      - Authority:
+        - terrain.query
+      summary: Lista a cobertura dos dados de terreno
+      operationId: getTerrainCoverage
+      description: |
+        **Escopo exigido no token de quem chama:** `terrain.query`
+
+        **Quem chama:** os SW-USS e os Gerenciadores de Constraints do DECEA, para saber onde há dados de terreno.
+
+        Devolve os blocos de 1° × 1° de que o serviço tem dados, como uma `FeatureCollection` GeoJSON (RFC 7946), com um polígono por bloco. Um ponto fora de todos os blocos não tem altitude do terreno.
+
+        **Atenção à ordem das coordenadas:** como manda o GeoJSON, cada vértice vem como `[longitude, latitude]`, ao contrário dos objetos `{lat, lng}` dos demais endpoints do BR-UTM.
+
+        Um bloco listado pode ter pixels sem dado (por exemplo, sobre o mar); nesses pontos, `GET /terrain/v1/elevation` responde `404`.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CoverageResponse'
+              examples:
+                umBloco:
+                  summary: Serviço com um bloco de dados, de 24° S a 23° S e de 47° W a 46° W
+                  value:
+                    type: FeatureCollection
+                    features:
+                    - type: Feature
+                      geometry:
+                        type: Polygon
+                        coordinates:
+                        - - - -47.0
+                            - -24.0
+                          - - -46.0
+                            - -24.0
+                          - - -46.0
+                            - -23.0
+                          - - -47.0
+                            - -23.0
+                          - - -47.0
+                            - -24.0
+                      properties:
+                        tile: Copernicus_DSM_COG_10_S24_00_W047_00_DEM.tif
+          description: A cobertura foi obtida com sucesso.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                semToken:
+                  summary: Header Authorization ausente
+                  value:
+                    message: missing Authorization header.
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado, é inválido ou expirou.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                escopo:
+                  summary: Token sem o escopo exigido
+                  value:
+                    message: 'missing required scope: terrain.query.'
+          description: >-
+            O token de acesso foi decodificado, mas o `scope` não contém `terrain.query`.
+components:
+  securitySchemes:
+    Authority:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: /token
+          scopes:
+            terrain.query: >-
+              O cliente pode consultar a altitude do terreno, converter altitudes e consultar a cobertura dos dados de terreno.
+      description: |
+        Token de acesso JWT emitido pelo Auth Server do BR-UTM em `GET /token` (ver `token.yaml`). O tipo `oauth2` é usado aqui só para declarar o escopo das operações: o BR-UTM não usa o fluxo OAuth *client credentials*.
+
+        Envie o token no header `Authorization: Bearer <token>`, com `aud` igual ao domínio do Provedor de Altitude de Terreno e `scope` contendo `terrain.query` (a claim pode ter vários escopos, separados por espaço).
+  schemas:
+    TerrainReference:
+      description: |
+        Referencial vertical da altitude do terreno.
+        - `W84`: altitude elipsoidal (WGS84), a referência dos volumes do BR-UTM.
+        - `EGM2008`: altitude em relação ao geoide do modelo EGM2008, o referencial dos dados de origem.
+      type: string
+      enum:
+      - W84
+      - EGM2008
+      default: W84
+    AltitudeReference:
+      description: |
+        Referencial de uma altitude a converter.
+        - `AGL`: altura acima do terreno deste serviço, no ponto.
+        - `W84`: altitude elipsoidal (WGS84), a referência dos volumes do BR-UTM.
+        - `EGM2008`: altitude em relação ao geoide do modelo EGM2008.
+      type: string
+      enum:
+      - AGL
+      - W84
+      - EGM2008
+    Units:
+      description: Unidade das altitudes deste serviço. Só metros são aceitos.
+      type: string
+      enum:
+      - m
+    ElevationResponse:
+      description: Altitude do terreno em um ponto.
+      type: object
+      required:
+      - lat
+      - lng
+      - elevation
+      - reference
+      - units
+      properties:
+        lat:
+          $ref: '#/components/schemas/Latitude'
+        lng:
+          $ref: '#/components/schemas/Longitude'
+        elevation:
+          description: >-
+            Altitude do terreno no pixel que contém o ponto, no referencial de `reference`.
+          type: number
+          format: double
+          example: 754.5
+        reference:
+          $ref: '#/components/schemas/TerrainReference'
+        units:
+          $ref: '#/components/schemas/Units'
+    ElevationPoint:
+      description: Altitude do terreno no centro de um pixel.
+      type: object
+      required:
+      - lat
+      - lng
+      - elevation
+      properties:
+        lat:
+          $ref: '#/components/schemas/Latitude'
+        lng:
+          $ref: '#/components/schemas/Longitude'
+        elevation:
+          description: Altitude do terreno no pixel, no referencial de `reference` da resposta.
+          type: number
+          format: double
+          example: 752.1
+    AreaElevationResponse:
+      description: Altitude do terreno em todos os pixels de um retângulo.
+      type: object
+      required:
+      - view
+      - points
+      - reference
+      - units
+      - count
+      properties:
+        view:
+          description: >-
+            O retângulo pedido, normalizado: `[lat_min, lng_min, lat_max, lng_max]`.
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: number
+            format: double
+          example:
+          - -23.5521
+          - -46.6361
+          - -23.5517
+          - -46.6357
+        points:
+          description: >-
+            Um item por pixel com dado dentro do retângulo, com as coordenadas do centro do pixel. Vazio se o retângulo estiver inteiramente fora da cobertura. A ordem não é garantida.
+          type: array
+          items:
+            $ref: '#/components/schemas/ElevationPoint'
+        reference:
+          $ref: '#/components/schemas/TerrainReference'
+        units:
+          $ref: '#/components/schemas/Units'
+        count:
+          description: Número de itens em `points`.
+          type: integer
+          minimum: 0
+          example: 4
+    ConvertibleAltitude:
+      description: Altitude com o seu referencial e unidade.
+      type: object
+      required:
+      - value
+      - reference
+      - units
+      properties:
+        value:
+          description: Valor numérico da altitude.
+          type: number
+          format: double
+          example: 100.0
+        reference:
+          $ref: '#/components/schemas/AltitudeReference'
+        units:
+          $ref: '#/components/schemas/Units'
+    AltitudeConvertRequest:
+      description: Pedido de conversão de uma altitude em um ponto.
+      type: object
+      required:
+      - lat
+      - lng
+      - from
+      - to
+      properties:
+        lat:
+          $ref: '#/components/schemas/Latitude'
+        lng:
+          $ref: '#/components/schemas/Longitude'
+        from:
+          $ref: '#/components/schemas/ConvertibleAltitude'
+        to:
+          $ref: '#/components/schemas/AltitudeReference'
+    AltitudeConvertResponse:
+      description: Resultado da conversão de uma altitude em um ponto.
+      type: object
+      required:
+      - lat
+      - lng
+      - from
+      - result
+      properties:
+        lat:
+          $ref: '#/components/schemas/Latitude'
+        lng:
+          $ref: '#/components/schemas/Longitude'
+        from:
+          $ref: '#/components/schemas/ConvertibleAltitude'
+        result:
+          $ref: '#/components/schemas/ConvertibleAltitude'
+    CoverageResponse:
+      description: >-
+        Cobertura dos dados de terreno, como uma `FeatureCollection` GeoJSON (RFC 7946), com um item por bloco de 1° × 1°.
+      type: object
+      required:
+      - type
+      - features
+      properties:
+        type:
+          type: string
+          enum:
+          - FeatureCollection
+        features:
+          description: Blocos de dados do serviço. Vazio se o serviço não tiver nenhum.
+          type: array
+          items:
+            $ref: '#/components/schemas/CoverageFeature'
+    CoverageFeature:
+      description: Um bloco de 1° × 1° de dados de terreno.
+      type: object
+      required:
+      - type
+      - geometry
+      properties:
+        type:
+          type: string
+          enum:
+          - Feature
+        geometry:
+          $ref: '#/components/schemas/CoveragePolygon'
+        properties:
+          description: Propriedades do bloco.
+          type: object
+          properties:
+            tile:
+              description: Nome do arquivo de dados do bloco, apenas informativo.
+              type: string
+              example: Copernicus_DSM_COG_10_S24_00_W047_00_DEM.tif
+    CoveragePolygon:
+      description: >-
+        Polígono GeoJSON do bloco: um único anel, fechado (o último vértice repete o primeiro), com cada vértice como `[longitude, latitude]`.
+      type: object
+      required:
+      - type
+      - coordinates
+      properties:
+        type:
+          type: string
+          enum:
+          - Polygon
+        coordinates:
+          type: array
+          items:
+            type: array
+            items:
+              type: array
+              minItems: 2
+              maxItems: 2
+              items:
+                type: number
+                format: double
+    ErrorResponse:
+      description: >-
+        Texto legível devolvido quando uma requisição ao Provedor de Altitude de Terreno resulta em erro.
+      type: object
+      properties:
+        message:
+          description: Mensagem legível que indica o erro e/ou o motivo.
+          type: string
+          example: tile not available for (-10.500000, -30.200000).
+    Latitude:
+      description: >-
+        Graus de latitude ao norte do equador, em relação ao elipsoide WGS84.
+      maximum: 90
+      exclusiveMaximum: false
+      minimum: -90
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: -23.5505
+    Longitude:
+      description: >-
+        Graus de longitude a leste do meridiano de Greenwich, em relação ao elipsoide WGS84.
+      minimum: -180
+      exclusiveMaximum: false
+      maximum: 180
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: -46.6333

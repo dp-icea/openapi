@@ -1,0 +1,3585 @@
+openapi: 3.0.2
+info:
+  title: DSS
+  version: 1.0.0
+  description: |
+    O DSS (Discovery and Synchronization Service) é o serviço do BR-UTM em que os SW-USS descobrem uns aos outros. Ele não guarda os detalhes das operações, só **referências**: onde e quando existe uma entidade, qual SW-USS a gerencia e a URL (`uss_base_url`) em que os detalhes podem ser obtidos diretamente com esse SW-USS.
+
+    ## Arquitetura
+
+    O DSS é um serviço do BR-UTM, escrito em Go e derivado do DSS da InterUSS, com modificações próprias. Ele fica atrás do API Gateway, que encaminha os caminhos `/dss` e `/rid/v2/dss` para o serviço, e roda em várias réplicas sem estado. Todo o estado fica em um banco **CockroachDB** (SQL distribuído), e cada escrita é feita em uma transação.
+
+    ### Como uma referência é guardada
+
+    O DSS não guarda os volumes que recebe em `extents`. Ele os reduz a um envelope aproximado, e é só isso que fica gravado:
+
+    - **Área:** a união dos contornos de todos os volumes é convertida em um conjunto de **células S2** de nível 13, com cerca de 1 km² cada. O S2 divide a superfície da Terra em uma hierarquia de células, e cada célula é identificada por um inteiro de 64 bits. Círculos são aproximados por um polígono de 20 lados antes da conversão.
+    - **Altitude:** um único intervalo, da menor `altitude_lower` à maior `altitude_upper` entre os volumes.
+    - **Tempo:** um único intervalo, do menor `time_start` ao maior `time_end`.
+    - **Demais campos:** ID, `manager` (o `sub` do token de quem criou), versão, OVN, `uss_base_url`, estado e a subscription associada.
+
+    As células ficam em uma coluna de inteiros com índice invertido. Uma consulta converte a área pedida em células S2 da mesma forma e devolve as referências que **compartilham pelo menos uma célula** com ela e cujos intervalos de altitude e de tempo se sobrepõem aos pedidos.
+
+    Consequências para quem integra:
+
+    1. **O DSS não conhece a geometria exata.** Uma referência devolvida pode não intersectar de fato a área consultada. A verificação exata é feita pelo SW-USS, com os detalhes obtidos no SW-USS que gerencia a entidade.
+    2. **Os volumes enviados ao DSS não precisam ser os exatos.** Um volume envolvente basta, desde que contenha todos os volumes (nominais e off-nominal) da operação.
+    3. **Limites:** polígonos de no máximo 2.500 km²; no máximo 10.000 operational intents por consulta.
+
+    ### Subscriptions e notificações
+
+    Uma subscription é uma área e um intervalo de tempo em que um SW-USS quer ser avisado de mudanças. **O DSS não envia notificações.** Quando um SW-USS cria, altera ou remove uma referência, o DSS procura as subscriptions que se sobrepõem à área nova e à antiga, incrementa o `notification_index` de cada uma e devolve a lista em `subscribers`. Quem fez a alteração notifica cada SW-USS da lista diretamente, nos endpoints `POST` de `sw-uss.yaml`. A lista inclui as subscriptions do próprio SW-USS.
+
+    Ao criar ou atualizar uma operational intent, o SW-USS pode pedir uma **subscription implícita** (`new_subscription`): o DSS a cria cobrindo a operação e a remove junto com a operational intent. Nas atualizações seguintes, envie o `subscription_id` dessa subscription para mantê-la (o DSS a amplia se a operação crescer). Uma atualização sem `subscription_id` e sem `new_subscription` deixa a operational intent sem subscription, o que só é aceito no estado `Accepted`.
+
+    ### OVN e `key`: prova de que o espaço aéreo foi lido
+
+    Cada versão de uma referência tem um OVN (*opaque version number*) gerado pelo DSS. O DSS só mostra o OVN ao `manager` da referência; para os demais SW-USS, o campo vem como `Available from USS`, e o OVN verdadeiro só é obtido nos detalhes, com o SW-USS que gerencia a entidade.
+
+    Ao criar ou alterar uma operational intent em `Accepted` ou `Activated`, o SW-USS envia em `key` os OVNs das operational intents que se sobrepõem à nova pelo critério de células, altitude e tempo e, se a subscription associada pede notificações de constraints (`notify_for_constraints`), também os OVNs das constraints. Se faltar algum, o DSS responde `409` com a lista do que falta. Assim, o DSS garante que nenhum SW-USS escreve sem ter lido o estado atual do espaço aéreo.
+
+    ### Constraints
+
+    Constraints são restrições do espaço aéreo; na Fase 1, só o DECEA as cria. Todo SW-USS que opera voos deve:
+
+    1. **Pedir notificações de constraints.** Ao criar a operational intent, envie `new_subscription` com `notify_for_constraints: true` (ou use uma subscription sua com `notify_for_constraints: true`). Isso exige o escopo `utm.constraint_processing` no token, junto com `utm.strategic_coordination`. Assim, o SW-USS recebe `POST /uss/v1/constraints` quando uma constraint da área muda, e o DSS passa a exigir na `key` os OVNs das constraints da área.
+    2. **Verificar sempre se a operational intent intersecta alguma constraint**, com os volumes exatos obtidos no SW-USS Gerenciador de Constraints. Uma operational intent que intersecta uma constraint não pode ser ativada.
+
+    ## Autenticação
+
+    Todas as operações exigem `Authorization: Bearer <token>`, com um token obtido em `GET /token` (ver `token.yaml`):
+
+    - `intended_audience`: o domínio do DSS, isto é, o host da URL base (ex.: `api.sandbox.brutm.icea.decea.mil.br`).
+    - `scope`: cada operação aceita um ou mais conjuntos de escopos, listados em `security` e no início da sua descrição. O token precisa conter todos os escopos de pelo menos um dos conjuntos.
+    - O `sub` do token vira o `manager` (ou `owner`) das entidades criadas, e só ele pode alterá-las ou removê-las.
+
+    Os erros vêm no corpo como `{"message": "..."}`.
+
+    ## Schemas
+
+    Schemas do Remote ID com o mesmo nome de um schema UTM, mas conteúdo diferente, recebem o prefixo `Rid` (ex.: `RidVolume4D`). Os operationIds de subscription do Remote ID também (ex.: `getRidSubscription`).
+servers:
+- url: http://api.sandbox.brutm.icea.decea.mil.br
+  description: Desenvolvimento (somente HTTP, sem TLS)
+- url: https://eco-utm.decea.mil.br
+  description: Produção
+security:
+- Authority:
+  - utm.strategic_coordination
+  - utm.conformance_monitoring_sa
+  - utm.constraint_processing
+  - utm.constraint_management
+  - utm.availability_arbitration
+  - rid.display_provider
+  - rid.service_provider
+tags:
+- name: Operational intent references
+  description: >-
+    Endpoints do DSS para referências de operational intents.
+- name: Constraint references
+  description: >-
+    Endpoints do DSS para referências de constraints.
+- name: Subscriptions
+  description: >-
+    Endpoints do DSS para subscriptions do UTM.
+- name: Reports
+  description: Endpoint do DSS para relatar problemas de comunicação.
+- name: Availability
+  description: Endpoints do DSS para declarar a disponibilidade de um SW-USS.
+- name: Identification Service Areas (Remote ID)
+  description: Endpoints do DSS para Identification Service Areas (ISAs) do Remote ID.
+- name: Subscriptions (Remote ID)
+  description: Endpoints do DSS para subscriptions do Remote ID.
+paths:
+  /dss/v1/operational_intent_references/query:
+    summary: >-
+      Consulta as operational intents do DSS que intersectam uma área geográfica, uma faixa de altitude e um intervalo de tempo.
+    description: Interface para as referências de operational intents no DSS.
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryOperationalIntentReferenceParameters'
+            examples:
+              area:
+                summary: Área de 1 km² em São Paulo, 0–120 m, das 14h às 14h30
+                value: &id003
+                  area_of_interest: &id001
+                    volume:
+                      outline_polygon:
+                        vertices:
+                        - lat: -23.55
+                          lng: -46.64
+                        - lat: -23.55
+                          lng: -46.63
+                        - lat: -23.54
+                          lng: -46.63
+                        - lat: -23.54
+                          lng: -46.64
+                      altitude_lower:
+                        value: 0
+                        reference: W84
+                        units: M
+                      altitude_upper:
+                        value: 120
+                        reference: W84
+                        units: M
+                    time_start:
+                      value: '2026-11-05T14:00:00Z'
+                      format: RFC3339
+                    time_end:
+                      value: '2026-11-05T14:30:00Z'
+                      format: RFC3339
+        required: true
+      tags:
+      - Operational intent references
+      security:
+      - Authority:
+        - utm.strategic_coordination
+      - Authority:
+        - utm.conformance_monitoring_sa
+      summary: >-
+        Consulta as operational intent references de uma área
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.strategic_coordination` ou `utm.conformance_monitoring_sa`
+
+        Devolve as operational intent references cujo envelope (células S2, faixa de altitude e intervalo de tempo) se sobrepõe à `area_of_interest`. É assim que o SW-USS descobre quem já opera numa área antes de planejar uma operação.
+
+        - `area_of_interest` é um Volume4D com contorno (polígono ou círculo), faixa de altitude e intervalo de tempo. Altitude e tempo podem ser omitidos; nesse caso, não há filtro nessas dimensões.
+        - O resultado é aproximado: basta compartilhar uma célula S2 de cerca de 1 km² para uma referência ser devolvida. Busque os detalhes de cada uma no SW-USS indicado em `uss_base_url` (`GET /uss/v1/operational_intents/{entityid}`) e verifique a interseção exata com eles.
+        - O `ovn` das referências de outros SW-USS vem como `Available from USS`; o OVN correto vem nos detalhes.
+        - No máximo 10.000 referências por consulta. Polígonos maiores que 2.500 km² são rejeitados.
+
+        Apesar do verbo POST, esta operação não altera nada no DSS: POST é usado porque nem todas as infraestruturas aceitam corpo em requisições GET.
+      operationId: queryOperationalIntentReferences
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryOperationalIntentReferenceResponse'
+              examples:
+                umaOperacao:
+                  summary: Uma operational intent de outro SW-USS na área
+                  value:
+                    operational_intent_references:
+                    - &id002
+                      id: 8a4c2f9e-3b7d-4e1a-9c6f-0d2e5b8a7c31
+                      manager: empresa-b
+                      uss_availability: Unknown
+                      version: 2
+                      state: Accepted
+                      ovn: Available from USS
+                      time_start:
+                        value: '2026-11-05T14:00:00Z'
+                        format: RFC3339
+                      time_end:
+                        value: '2026-11-05T14:30:00Z'
+                        format: RFC3339
+                      uss_base_url: https://uss.empresa-b.com.br/utm
+                      subscription_id: 0b6d2c4e-8f1a-4e3b-a5c7-9d1f3e5b7a29
+          description: As operational intents foram obtidas com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A área solicitada é grande demais.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+  /dss/v1/operational_intent_references/{entityid}:
+    summary: >-
+      Criação e leitura de uma operational intent reference no DSS.
+    parameters:
+    - name: entityid
+      description: EntityID da operational intent.
+      schema:
+        $ref: '#/components/schemas/EntityID'
+      in: path
+      required: true
+    get:
+      tags:
+      - Operational intent references
+      security:
+      - Authority:
+        - utm.strategic_coordination
+      - Authority:
+        - utm.conformance_monitoring_sa
+      summary: >-
+        Obtém uma operational intent reference
+      operationId: getOperationalIntentReference
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetOperationalIntentReferenceResponse'
+          description: A operational intent reference foi obtida com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A entidade solicitada não foi encontrada.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.strategic_coordination` ou `utm.conformance_monitoring_sa`
+
+        Devolve a operational intent reference com o ID informado. Se ela for de outro SW-USS, o `ovn` vem como `Available from USS`.
+
+        Use para conferir o estado e a versão atuais de uma referência. Os detalhes (volumes exatos, prioridade etc.) só existem no SW-USS que a gerencia.
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutOperationalIntentReferenceParameters'
+            examples:
+              accepted:
+                summary: Criação em Accepted, com subscription implícita que notifica constraints
+                value:
+                  extents:
+                  - *id001
+                  key:
+                  - Y-8pfahhmSGR1Mnuv1Oc-.HOK5MhF67-v2Fo8uvev.k_
+                  - xrjOayrr64dKAR6MZR2rVUOpqC8FsDntbACrOOMCgjw_
+                  state: Accepted
+                  uss_base_url: https://uss.empresa-a.com.br/utm
+                  new_subscription:
+                    uss_base_url: https://uss.empresa-a.com.br/utm
+                    notify_for_constraints: true
+        required: true
+      tags:
+      - Operational intent references
+      security:
+      - Authority:
+        - utm.strategic_coordination
+      - Authority:
+        - utm.strategic_coordination
+        - utm.constraint_processing
+      - Authority:
+        - utm.conformance_monitoring_sa
+      summary: Cria uma operational intent reference
+      operationId: createOperationalIntentReference
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeOperationalIntentReferenceResponse'
+              examples:
+                criada:
+                  summary: Referência criada; notifique os dois subscribers
+                  value:
+                    operational_intent_reference:
+                      id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                      manager: empresa-a
+                      uss_availability: Unknown
+                      version: 1
+                      state: Accepted
+                      ovn: v.v5qNvwU.VccnOCgBA-CEfqltpTC-3qN-2iKbRusEQ_
+                      time_start:
+                        value: '2026-11-05T14:00:00Z'
+                        format: RFC3339
+                      time_end:
+                        value: '2026-11-05T14:30:00Z'
+                        format: RFC3339
+                      uss_base_url: https://uss.empresa-a.com.br/utm
+                      subscription_id: 78ea3fe8-71c2-4f5c-9b44-9c02f5563c6f
+                    subscribers:
+                    - uss_base_url: https://uss.empresa-b.com.br/utm
+                      subscriptions:
+                      - subscription_id: 0b6d2c4e-8f1a-4e3b-a5c7-9d1f3e5b7a29
+                        notification_index: 7
+                    - uss_base_url: https://uss.empresa-a.com.br/utm
+                      subscriptions:
+                      - subscription_id: 78ea3fe8-71c2-4f5c-9b44-9c02f5563c6f
+                        notification_index: 1
+          description: >-
+            A operational intent reference foi criada com sucesso no DSS.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a operational intent de uma forma não permitida.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AirspaceConflictResponse'
+              examples:
+                faltaOvn:
+                  summary: Faltou o OVN da operational intent da empresa B na key
+                  value:
+                    message: Current OVNs not provided for one or more OperationalIntents or Constraints
+                    missing_operational_intents:
+                    - *id002
+          description: |
+            * A `key` enviada não prova o conhecimento de todas as entidades atuais e relevantes do espaço aéreo (o corpo da resposta traz `missing_operational_intents` e/ou `missing_constraints`).
+            * Apesar de várias tentativas, o DSS não conseguiu concluir a alteração por causa de outras alterações simultâneas.
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A área da operational intent é grande demais.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.strategic_coordination` ou `utm.strategic_coordination` + `utm.constraint_processing` ou `utm.conformance_monitoring_sa`
+
+        Registra no DSS a referência de uma nova operational intent. O `entityid` é um UUIDv4 gerado pelo seu SW-USS.
+
+        1. Consulte a área em `POST /dss/v1/operational_intent_references/query` e em `POST /dss/v1/constraint_references/query`, e busque os detalhes das entidades encontradas.
+        2. Verifique os conflitos com os volumes exatos. Se a operational intent intersectar uma constraint, ela não poderá ser ativada.
+        3. Envie a criação com `state: Accepted` (o único estado aceito na criação), os `extents`, o `uss_base_url` do seu SW-USS, `new_subscription` com `notify_for_constraints: true` e, em `key`, os OVNs das operational intents e das constraints encontradas.
+        4. Se faltar algum OVN, o DSS responde `409` com `missing_operational_intents` e/ou `missing_constraints`. Busque os detalhes dessas entidades, acrescente os OVNs à `key` e repita.
+        5. Guarde o `ovn` da resposta (necessário para atualizar ou remover) e notifique cada SW-USS listado em `subscribers` com `POST /uss/v1/operational_intents`.
+
+        Use um token com `utm.strategic_coordination` e `utm.constraint_processing`, o conjunto necessário para pedir notificações de constraints.
+
+        Validações do DSS:
+
+        - Os `extents` não podem terminar no passado, e o fim deve ser posterior ao início.
+        - Com `new_subscription`, o DSS cria uma subscription implícita que cobre a operação. Em vez disso, você pode informar em `subscription_id` uma subscription sua que cubra a operação no espaço e no tempo; caso contrário, `400`.
+        - O DSS não lê nem guarda o campo `flight_type`.
+  /dss/v1/operational_intent_references/{entityid}/{ovn}:
+    summary: >-
+      Atualização e remoção de uma operational intent reference no DSS.
+    parameters:
+    - name: entityid
+      description: EntityID da operational intent.
+      schema:
+        $ref: '#/components/schemas/EntityID'
+      in: path
+      required: true
+    - name: ovn
+      description: >-
+        OVN (opaque version number) atual da operational intent reference.
+      schema:
+        $ref: '#/components/schemas/EntityOVN'
+      in: path
+      required: true
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutOperationalIntentReferenceParameters'
+            examples:
+              activated:
+                summary: Ativação, mantendo a subscription implícita criada antes
+                value:
+                  extents:
+                  - *id001
+                  key:
+                  - Y-8pfahhmSGR1Mnuv1Oc-.HOK5MhF67-v2Fo8uvev.k_
+                  - xrjOayrr64dKAR6MZR2rVUOpqC8FsDntbACrOOMCgjw_
+                  state: Activated
+                  uss_base_url: https://uss.empresa-a.com.br/utm
+                  subscription_id: 78ea3fe8-71c2-4f5c-9b44-9c02f5563c6f
+        required: true
+      tags:
+      - Operational intent references
+      security:
+      - Authority:
+        - utm.strategic_coordination
+      - Authority:
+        - utm.strategic_coordination
+        - utm.constraint_processing
+      - Authority:
+        - utm.conformance_monitoring_sa
+      summary: Atualiza uma operational intent reference
+      operationId: updateOperationalIntentReference
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeOperationalIntentReferenceResponse'
+              examples:
+                ativada:
+                  summary: Referência ativada, com novo OVN
+                  value:
+                    operational_intent_reference:
+                      id: 2f8343be-6482-4d1b-a474-16847e01af1e
+                      manager: empresa-a
+                      uss_availability: Unknown
+                      version: 2
+                      state: Activated
+                      ovn: 6LsTWURy3osoT7kkrJc3VuPyGbuc7TOK0l7kfkv8hYI_
+                      time_start:
+                        value: '2026-11-05T14:00:00Z'
+                        format: RFC3339
+                      time_end:
+                        value: '2026-11-05T14:30:00Z'
+                        format: RFC3339
+                      uss_base_url: https://uss.empresa-a.com.br/utm
+                      subscription_id: 78ea3fe8-71c2-4f5c-9b44-9c02f5563c6f
+                    subscribers:
+                    - uss_base_url: https://uss.empresa-b.com.br/utm
+                      subscriptions:
+                      - subscription_id: 0b6d2c4e-8f1a-4e3b-a5c7-9d1f3e5b7a29
+                        notification_index: 8
+                    - uss_base_url: https://uss.empresa-a.com.br/utm
+                      subscriptions:
+                      - subscription_id: 78ea3fe8-71c2-4f5c-9b44-9c02f5563c6f
+                        notification_index: 2
+          description: >-
+            A operational intent reference foi atualizada com sucesso no DSS.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a operational intent de uma forma não permitida.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AirspaceConflictResponse'
+          description: |
+            * A `key` enviada não prova o conhecimento de todas as entidades atuais e relevantes do espaço aéreo (o corpo da resposta traz `missing_operational_intents` e/ou `missing_constraints`).
+            * O `ovn` enviado não corresponde à versão atual da operational intent.
+            * Apesar de várias tentativas, o DSS não conseguiu concluir a alteração por causa de outras alterações simultâneas.
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A área da operational intent é grande demais.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.strategic_coordination` ou `utm.strategic_coordination` + `utm.constraint_processing` ou `utm.conformance_monitoring_sa`
+
+        Substitui a referência por uma nova versão: mudança de estado (ex.: `Accepted` → `Activated`), de volumes ou de subscription. Envie no caminho o `ovn` atual, o que o DSS devolveu na última criação ou atualização. Só o `manager` (o `sub` do token que criou a referência) pode atualizá-la, e um `ovn` diferente do atual resulta em `409`.
+
+        - Uma operational intent que intersecta uma constraint não pode ser passada para `Activated`.
+        - Em `Accepted` e `Activated`, valem as mesmas regras de `key` da criação: consulte a área, busque os detalhes e envie os OVNs. Um `409` com `missing_*` indica o que falta. Em `Nonconforming` e `Contingent`, a `key` não é exigida.
+        - Passar para `Nonconforming` ou `Contingent` exige o escopo `utm.conformance_monitoring_sa` no token; sem ele, `403`.
+        - Informe a subscription em toda atualização: `subscription_id` (por exemplo, o da subscription implícita criada antes, que o DSS amplia se a operação crescer) ou `new_subscription`. Sem nenhum dos dois, a operational intent fica sem subscription, o que só é aceito em `Accepted`.
+        - O DSS procura as subscriptions afetadas na área nova e na antiga. Notifique cada SW-USS listado em `subscribers` com `POST /uss/v1/operational_intents` e guarde o novo `ovn` da resposta.
+    delete:
+      tags:
+      - Operational intent references
+      security:
+      - Authority:
+        - utm.strategic_coordination
+      - Authority:
+        - utm.conformance_monitoring_sa
+      summary: Remove uma operational intent reference
+      operationId: deleteOperationalIntentReference
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeOperationalIntentReferenceResponse'
+          description: >-
+            A operational intent foi removida do DSS com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a operational intent de uma forma não permitida.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A entidade solicitada não foi encontrada.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * O `ovn` enviado não corresponde à versão atual da operational intent.
+            * Apesar de várias tentativas, o DSS não conseguiu concluir a alteração por causa de outras alterações simultâneas.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+
+  #
+  # DSS endpoints for constraints
+  #
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.strategic_coordination` ou `utm.conformance_monitoring_sa`
+
+        Remove a referência, por exemplo ao fim da operação. Envie no caminho o `ovn` atual. Só o `manager` pode remover, e a `key` não é exigida.
+
+        - A resposta traz a referência removida e, em `subscribers`, os SW-USS a notificar com `POST /uss/v1/operational_intents`.
+        - Se a operational intent usava uma subscription implícita que nenhuma outra operational intent usa, o DSS remove a subscription junto.
+  /dss/v1/constraint_references/query:
+    summary: >-
+      Consulta as constraint references do DSS que intersectam uma área, uma faixa de altitude e um intervalo de tempo.
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryConstraintReferenceParameters'
+            examples:
+              area:
+                summary: Mesma área da consulta de operational intents
+                value: *id003
+        required: true
+      tags:
+      - Constraint references
+      security:
+      - Authority:
+        - utm.constraint_management
+      - Authority:
+        - utm.constraint_processing
+      summary: >-
+        Consulta as constraint references de uma área
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.constraint_management` ou `utm.constraint_processing`
+
+        Devolve as constraint references cujo envelope (células S2, faixa de altitude e intervalo de tempo) se sobrepõe à `area_of_interest`.
+
+        Funciona como a consulta de operational intents: o resultado é aproximado, e os detalhes de cada constraint são obtidos no SW-USS Gerenciador de Constraints indicado em `uss_base_url` (`GET /uss/v1/constraints/{entityid}`). O `ovn` de constraints de outros gerenciadores vem como `Available from USS`; o OVN correto vem nos detalhes.
+
+        Apesar do verbo POST, esta operação não altera nada no DSS: POST é usado porque nem todas as infraestruturas aceitam corpo em requisições GET.
+      operationId: queryConstraintReferences
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryConstraintReferencesResponse'
+              examples:
+                umaConstraint:
+                  summary: Uma constraint do DECEA na área
+                  value:
+                    constraint_references:
+                    - id: c3a1e7d2-5f4b-4a8e-b9d0-6e2f1a3c7b54
+                      manager: decea
+                      uss_availability: Normal
+                      version: 1
+                      ovn: Available from USS
+                      time_start:
+                        value: '2026-11-05T00:00:00Z'
+                        format: RFC3339
+                      time_end:
+                        value: '2026-11-06T00:00:00Z'
+                        format: RFC3339
+                      uss_base_url: https://gerenciador-a.exemplo.br/utm
+          description: As constraint references foram obtidas com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A área solicitada é grande demais.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+  /dss/v1/constraint_references/{entityid}:
+    parameters:
+    - name: entityid
+      description: EntityID da constraint.
+      schema:
+        $ref: '#/components/schemas/EntityID'
+      in: path
+      required: true
+    summary: >-
+      Criação e leitura de uma constraint reference no DSS.
+    get:
+      tags:
+      - Constraint references
+      security:
+      - Authority:
+        - utm.constraint_management
+      - Authority:
+        - utm.constraint_processing
+      summary: Obtém uma constraint reference
+      operationId: getConstraintReference
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetConstraintReferenceResponse'
+          description: A constraint reference foi obtida com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A entidade solicitada não foi encontrada.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.constraint_management` ou `utm.constraint_processing`
+
+        Devolve a constraint reference com o ID informado. Se ela for de outro gerenciador, o `ovn` vem como `Available from USS`.
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutConstraintReferenceParameters'
+        required: true
+      tags:
+      - Constraint references
+      security:
+      - Authority:
+        - utm.constraint_management
+      summary: Cria uma constraint reference
+      operationId: createConstraintReference
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeConstraintReferenceResponse'
+          description: >-
+            A constraint reference foi criada com sucesso no DSS.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a constraint de uma forma não permitida.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Já existe uma constraint com o ID informado.
+            * Apesar de várias tentativas, o DSS não conseguiu concluir a alteração por causa de outras alterações simultâneas.
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A área da constraint é grande demais.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+      description: |
+        **Escopo:** `utm.constraint_management`
+
+        Registra a referência de uma nova constraint. Usado apenas pelo SW-USS Gerenciador de Constraints; na Fase 1, só o DECEA cria constraints.
+
+        - Envie `extents` com início e fim e, em `uss_base_url`, a URL base do servidor que fornece os detalhes da constraint.
+        - Não há `key`: a criação de uma constraint não depende do estado do espaço aéreo.
+        - Notifique os SW-USS listados em `subscribers` com `POST /uss/v1/constraints`.
+  /dss/v1/constraint_references/{entityid}/{ovn}:
+    parameters:
+    - name: entityid
+      description: EntityID da constraint.
+      schema:
+        $ref: '#/components/schemas/EntityID'
+      in: path
+      required: true
+    - name: ovn
+      description: >-
+        OVN (opaque version number) atual da operational intent reference.
+      schema:
+        $ref: '#/components/schemas/EntityOVN'
+      in: path
+      required: true
+    summary: >-
+      Atualização e remoção de uma constraint reference no DSS.
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutConstraintReferenceParameters'
+        required: true
+      tags:
+      - Constraint references
+      security:
+      - Authority:
+        - utm.constraint_management
+      summary: Atualiza uma constraint reference
+      operationId: updateConstraintReference
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeConstraintReferenceResponse'
+          description: >-
+            A constraint reference foi atualizada com sucesso no DSS.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a constraint de uma forma não permitida.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * O `ovn` enviado não corresponde à versão atual da constraint.
+            * Apesar de várias tentativas, o DSS não conseguiu concluir a alteração por causa de outras alterações simultâneas.
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A área da constraint é grande demais.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+      description: |
+        **Escopo:** `utm.constraint_management`
+
+        Substitui a constraint reference por uma nova versão. Envie no caminho o `ovn` atual; só o `manager` pode atualizar. Notifique os SW-USS listados em `subscribers` com `POST /uss/v1/constraints`.
+    delete:
+      tags:
+      - Constraint references
+      security:
+      - Authority:
+        - utm.constraint_management
+      summary: Remove uma constraint reference
+      operationId: deleteConstraintReference
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChangeConstraintReferenceResponse'
+          description: A constraint foi removida do DSS com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a constraint de uma forma não permitida.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A entidade solicitada não foi encontrada.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * O `ovn` enviado não corresponde à versão atual da constraint.
+            * Apesar de várias tentativas, o DSS não conseguiu concluir a alteração por causa de outras alterações simultâneas.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+
+  #
+  # DSS endpoints for subscriptions
+  #
+      description: |
+        **Escopo:** `utm.constraint_management`
+
+        Remove a constraint reference. Envie no caminho o `ovn` atual; só o `manager` pode remover. Notifique os SW-USS listados em `subscribers` com `POST /uss/v1/constraints`.
+  /dss/v1/subscriptions/query:
+    summary: Subscriptions para receber atualizações do espaço aéreo em um volume de interesse.
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QuerySubscriptionParameters'
+        required: true
+      tags:
+      - Subscriptions
+      security:
+      - Authority:
+        - utm.constraint_processing
+      - Authority:
+        - utm.strategic_coordination
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.constraint_processing` ou `utm.strategic_coordination`
+
+        Devolve as subscriptions **do próprio cliente** que se sobrepõem à `area_of_interest` (altitude e tempo podem ser omitidos). Serve para recuperar subscriptions perdidas.
+
+        As notificações de subscription só acontecem quando entidades do DSS são criadas, alteradas ou removidas, e trazem apenas as informações da entidade; não transportam outros dados, como telemetria do Remote ID.
+
+        Apesar do verbo POST, esta operação não altera nada no DSS: POST é usado porque nem todas as infraestruturas aceitam corpo em requisições GET.
+      summary: >-
+        Consulta as suas subscriptions de uma área
+      operationId: querySubscriptions
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuerySubscriptionsResponse'
+          description: As subscriptions foram obtidas com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: A área solicitada é grande demais.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+  /dss/v1/subscriptions/{subscriptionid}:
+    summary: Criação e leitura de uma subscription no DSS.
+    parameters:
+    - name: subscriptionid
+      description: SubscriptionID da subscription.
+      schema:
+        $ref: '#/components/schemas/SubscriptionID'
+      in: path
+      required: true
+    get:
+      tags:
+      - Subscriptions
+      security:
+      - Authority:
+        - utm.constraint_processing
+      - Authority:
+        - utm.strategic_coordination
+      summary: Obtém uma subscription
+      operationId: getSubscription
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.constraint_processing` ou `utm.strategic_coordination`
+
+        Devolve a subscription com o ID informado.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetSubscriptionResponse'
+          description: A subscription foi obtida com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Não existe subscription com o ID informado.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+    put:
+      security:
+      - Authority:
+        - utm.constraint_processing
+      - Authority:
+        - utm.strategic_coordination
+      summary: Cria uma subscription
+      operationId: createSubscription
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.constraint_processing` ou `utm.strategic_coordination`
+
+        Cria uma subscription avulsa: uma área e um intervalo de tempo em que você quer ser notificado de mudanças em operational intents (`notify_for_operational_intents`) e/ou em constraints (`notify_for_constraints`). Pelo menos uma das duas opções deve ser verdadeira.
+
+        O DSS do BR-UTM não confere o escopo de cada tipo de notificação: com qualquer um dos escopos aceitos, a subscription pode pedir notificações de operational intents, de constraints ou de ambas. Conferir o escopo de cada tipo é uma melhoria prevista do DSS.
+
+        Um SW-USS que só opera voos em geral não precisa de subscriptions avulsas: a subscription implícita, pedida com `new_subscription` ao criar ou atualizar a operational intent, já cobre a operação. Subscriptions avulsas servem a quem quer acompanhar uma área, como um visualizador.
+
+        - O `uss_base_url` é a URL base em que o seu SW-USS recebe as notificações (`POST /uss/v1/operational_intents` e `POST /uss/v1/constraints`).
+        - A resposta já traz as operational intents e/ou constraints que existem na área naquele momento.
+        - A criação falha se já existir uma subscription com o mesmo ID.
+
+        As notificações de subscription só acontecem quando entidades do DSS são criadas, alteradas ou removidas, e trazem apenas as informações da entidade; não transportam outros dados, como telemetria do Remote ID.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutSubscriptionParameters'
+        required: true
+      tags:
+      - Subscriptions
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PutSubscriptionResponse'
+          description: A subscription foi criada com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a subscription de uma forma não permitida.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint ou à requisição.
+            * O cliente pediu notificações de um tipo de entidade a que os escopos do token não dão acesso.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Já existe uma subscription com o ID informado.
+            * Apesar de várias tentativas, o DSS não conseguiu concluir a alteração por causa de outras alterações simultâneas.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente pode ter feito requisições demais em pouco tempo.
+  /dss/v1/subscriptions/{subscriptionid}/{version}:
+    summary: Atualização e remoção de uma subscription no DSS.
+    parameters:
+    - name: subscriptionid
+      description: SubscriptionID da subscription.
+      schema:
+        $ref: '#/components/schemas/SubscriptionID'
+      in: path
+      required: true
+    - name: version
+      description: 'Versão atual da subscription, como o DSS a devolveu no campo `version` (na criação, na última atualização ou num `GET`). É um texto opaco: envie exatamente o valor recebido.'
+      schema:
+        type: string
+      in: path
+      required: true
+      example: RrDXHiEknrlVXOo-hUYyT1wi-jTTcpZbk9UI.fJbiac_
+    put:
+      security:
+      - Authority:
+        - utm.constraint_processing
+      - Authority:
+        - utm.strategic_coordination
+      summary: Atualiza uma subscription
+      operationId: updateSubscription
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.constraint_processing` ou `utm.strategic_coordination`
+
+        Substitui a subscription por uma nova versão. Envie no caminho a `version` atual; só o dono pode alterar.
+
+        O DSS do BR-UTM não confere o escopo de cada tipo de notificação: com qualquer um dos escopos aceitos, a subscription pode pedir notificações de operational intents, de constraints ou de ambas. Conferir o escopo de cada tipo é uma melhoria prevista do DSS.
+
+        A norma exige que cada operational intent tenha uma subscription que cubra o seu volume 4D. Se a alteração fizer uma operational intent dependente perder essa cobertura, o DSS a rejeita com `400`.
+
+        As notificações de subscription só acontecem quando entidades do DSS são criadas, alteradas ou removidas, e trazem apenas as informações da entidade; não transportam outros dados, como telemetria do Remote ID.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PutSubscriptionParameters'
+        required: true
+      tags:
+      - Subscriptions
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PutSubscriptionResponse'
+          description: A subscription foi atualizada com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a subscription de uma forma não permitida.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint ou à requisição.
+            * O cliente pediu notificações de um tipo de entidade a que os escopos do token não dão acesso.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Já existe uma subscription com o ID informado, gerenciada por outro cliente.
+            * A `version` enviada não corresponde à versão atual da subscription.
+            * Apesar de várias tentativas, o DSS não conseguiu concluir a alteração por causa de outras alterações simultâneas.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente pode ter feito requisições demais em pouco tempo.
+    delete:
+      tags:
+      - Subscriptions
+      security:
+      - Authority:
+        - utm.constraint_processing
+      - Authority:
+        - utm.strategic_coordination
+      summary: Remove uma subscription
+      operationId: deleteSubscription
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.constraint_processing` ou `utm.strategic_coordination`
+
+        Remove a subscription. Envie no caminho a `version` atual; só o dono pode remover.
+
+        Uma subscription de que alguma operational intent depende não pode ser removida (`400`). Subscriptions implícitas são removidas pelo próprio DSS junto com a operational intent.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteSubscriptionResponse'
+          description: A subscription foi removida do DSS com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: Não existe subscription com o ID informado.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * A subscription com o ID informado é gerenciada por outro cliente.
+            * A `version` enviada não corresponde à versão atual da subscription.
+            * Apesar de várias tentativas, o DSS não conseguiu concluir a remoção por causa de outras alterações simultâneas.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+
+  #
+  # DSS endpoints for reports
+  #
+  /dss/v1/reports:
+    summary: Relatos de possíveis problemas operacionais relevantes para o DSS.
+    post:
+      security:
+      - Authority:
+        - utm.constraint_management
+      - Authority:
+        - utm.constraint_processing
+      - Authority:
+        - utm.strategic_coordination
+      - Authority:
+        - utm.conformance_monitoring_sa
+      - Authority:
+        - utm.availability_arbitration
+      summary: Relata um problema ao DSS
+      operationId: makeDssReport
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.constraint_management` ou `utm.constraint_processing` ou `utm.strategic_coordination` ou `utm.conformance_monitoring_sa` ou `utm.availability_arbitration`
+
+        Envia ao DSS o relato de um problema de comunicação: a requisição, a resposta e a descrição do problema. O DSS do BR-UTM atribui um `report_id`, registra o relato em log e o devolve na resposta; não há outra ação automática.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ErrorReport'
+        required: true
+      tags:
+      - Reports
+      responses:
+        '201':
+          description: O relato foi criado (e arquivado) com sucesso.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorReport'
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: |
+            * Um ou mais parâmetros estão ausentes ou inválidos.
+            * Não foi possível interpretar o relato, ou ele contém dados não reconhecidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint ou à requisição.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+
+  #
+  # DSS endpoints for USS availability
+  #
+  /dss/v1/uss_availability/{uss_id}:
+    summary: Estado de disponibilidade de um SW-USS.
+    parameters:
+    - name: uss_id
+      description: >-
+        ID do cliente (igual ao `sub` dos seus tokens de acesso) do SW-USS a que esta disponibilidade se refere.
+      schema:
+        type: string
+      in: path
+      required: true
+      example: empresa-b
+    put:
+      security:
+      - Authority:
+        - utm.availability_arbitration
+      summary: Define a disponibilidade de um SW-USS
+      operationId: setUssAvailability
+      description: |
+        **Escopo:** `utm.availability_arbitration`
+
+        Define o estado de disponibilidade (`Unknown`, `Normal` ou `Down`) de um SW-USS.
+
+        **O que `Down` muda no DSS do BR-UTM:** as operational intents do SW-USS `Down` que estão em `Accepted` deixam de ser exigidas na `key` de quem cria ou altera operational intents na mesma área. É só isso:
+
+        - as operational intents do SW-USS `Down` não são removidas nem invalidadas e continuam aparecendo nas consultas, com `uss_availability: Down`;
+        - as que estão em `Activated`, `Nonconforming` ou `Contingent` continuam exigidas na `key`;
+        - o SW-USS `Down` continua podendo criar, alterar e remover as próprias operational intents: o DSS do BR-UTM não bloqueia as operações de um SW-USS `Down`.
+
+        **Quem pode chamar:** qualquer cliente com o escopo `utm.availability_arbitration`, para qualquer `uss_id`. O DSS não restringe `uss_id` ao `sub` do token: quem tem esse escopo pode declarar qualquer SW-USS indisponível. O escopo serve para arbitrar a disponibilidade com base em evidência de que um SW-USS não responde, ou para um SW-USS declarar o próprio estado (por exemplo, `Down` antes de uma parada e `Normal` na volta). **Não o use para tornar outro SW-USS indisponível com o objetivo de ignorar as operações dele:** isso compromete a desconflitação de todos os participantes.
+
+        Envie em `old_version` a versão atual, obtida no `GET` (vazia se a disponibilidade nunca foi definida). O DSS do BR-UTM hoje não confere esse valor.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetUssAvailabilityStatusParameters'
+            examples:
+              down:
+                summary: Declara um SW-USS indisponível
+                value:
+                  old_version: KGjtHT44V-BSZm1dbCD19AR9ssWXfzDgW5TsJVoz0TQ_
+                  availability: Down
+        required: true
+      tags:
+      - Availability
+      responses:
+        '200':
+          description: >-
+            O estado de disponibilidade do SW-USS foi atualizado com sucesso.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UssAvailabilityStatusResponse'
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: '* Um ou mais parâmetros estão ausentes ou inválidos.'
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint ou à requisição.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+    get:
+      security:
+      - Authority:
+        - utm.availability_arbitration
+      - Authority:
+        - utm.strategic_coordination
+      - Authority:
+        - utm.conformance_monitoring_sa
+      summary: Obtém a disponibilidade de um SW-USS
+      operationId: getUssAvailability
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `utm.availability_arbitration` ou `utm.strategic_coordination` ou `utm.conformance_monitoring_sa`
+
+        Devolve o estado de disponibilidade (`Unknown`, `Normal` ou `Down`) e a versão atual da disponibilidade do SW-USS cujo `sub` é `uss_id`. Um SW-USS cuja disponibilidade nunca foi definida aparece como `Unknown`, com `version` vazia.
+
+        O efeito de cada estado no DSS está descrito em `PUT /dss/v1/uss_availability/{uss_id}`.
+      tags:
+      - Availability
+      responses:
+        '200':
+          description: >-
+            O estado de disponibilidade do SW-USS foi obtido com sucesso.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UssAvailabilityStatusResponse'
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: '* Um ou mais parâmetros estão ausentes ou inválidos.'
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint ou à requisição.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+
+  #
+  # USS endpoints for operational intents
+  #
+  /rid/v2/dss/identification_service_areas:
+    summary: Conjunto de Identification Service Areas no DSS.
+    description: ''
+    get:
+      tags:
+      - Identification Service Areas (Remote ID)
+      operationId: searchIdentificationServiceAreas
+      parameters:
+      - name: area
+        description: 'Área em que as Identification Service Areas serão buscadas. Algumas ISAs próximas, mas totalmente fora desta área, também podem ser devolvidas. Não repita o primeiro ponto no fim: o DSS fecha o polígono sozinho e rejeita (`400`) uma área cujo último ponto repete o primeiro.'
+        schema:
+          $ref: '#/components/schemas/GeoPolygonString'
+        in: query
+        required: true
+        example: -23.55,-46.64,-23.55,-46.63,-23.54,-46.63,-23.54,-46.64
+      - name: earliest_time
+        description: Se informado, indica que não há interesse em ISAs que terminam antes deste instante. Formato RFC 3339, conforme a especificação OpenAPI. O fuso horário deve ser 'Z'.
+        schema:
+          format: date-time
+          type: string
+        in: query
+        required: true
+        example: '2026-11-05T14:00:00Z'
+      - name: latest_time
+        description: Se informado, indica que não há interesse em ISAs que começam depois deste instante. Formato RFC 3339, conforme a especificação OpenAPI. O fuso horário deve ser 'Z'.
+        schema:
+          format: date-time
+          type: string
+        in: query
+        required: true
+        example: '2026-11-05T16:00:00Z'
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchIdentificationServiceAreasResponse'
+          description: As Identification Service Areas foram obtidas com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        413:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: A área solicitada é grande demais.
+      security:
+      - Authority:
+        - rid.display_provider
+      summary: Busca as ISAs de uma área
+      description: |
+        **Escopo:** `rid.display_provider`
+
+        Devolve as Identification Service Areas que se sobrepõem a `area`, com filtro opcional por `earliest_time` e `latest_time`. Algumas ISAs devolvidas podem estar inteiramente fora da área pedida.
+
+        `area` é a lista de vértices do polígono em texto: `lat1,lng1,lat2,lng2,...`, sem repetir o primeiro ponto no fim. O DSS fecha o polígono sozinho e rejeita (`400`) uma área cujo último ponto repete o primeiro. Exemplo de um quadrado: `-23.55,-46.64,-23.55,-46.63,-23.54,-46.63,-23.54,-46.64`.
+
+        Cada ISA devolvida é só uma referência (veja `GET /rid/v2/dss/identification_service_areas/{id}`). Usada por quem consome telemetria (Display Provider): para cada ISA, consulte os voos no SW-USS indicado em `uss_base_url` (`GET /uss/flights`).
+  /rid/v2/dss/identification_service_areas/{id}:
+    summary: Uma Identification Service Area no DSS.
+    parameters:
+    - name: id
+      description: EntityUUID da Identification Service Area.
+      schema:
+        $ref: '#/components/schemas/EntityUUID'
+      in: path
+      required: true
+    get:
+      tags:
+      - Identification Service Areas (Remote ID)
+      operationId: getIdentificationServiceArea
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetIdentificationServiceAreaResponse'
+              examples:
+                isa:
+                  summary: 'A ISA é só uma referência: sem área e sem dados de voo'
+                  value:
+                    service_area: &id004
+                      uss_base_url: https://uss.empresa-a.com.br/rid
+                      owner: empresa-a
+                      time_start: &id007
+                        value: '2026-11-05T13:58:00Z'
+                        format: RFC3339
+                      time_end:
+                        value: '2026-11-05T14:40:00Z'
+                        format: RFC3339
+                      version: 1hp9apg58umv8
+                      id: 5e1f3a7c-9b2d-4c6e-8f0a-1d3b5c7e9f2a
+          description: A ISA foi obtida com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        404:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: A entidade solicitada não foi encontrada.
+      security:
+      - Authority:
+        - rid.display_provider
+      summary: Obtém uma ISA
+      description: |
+        **Escopo:** `rid.display_provider`
+
+        Devolve a ISA como o DSS a guarda, que é só uma referência: `id`, `owner`, `uss_base_url`, `time_start`, `time_end` e `version`. A área da ISA não é devolvida (o DSS guarda só as células S2 que a cobrem), e os dados dos voos ficam no SW-USS indicado em `uss_base_url` (`GET /uss/flights`).
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateIdentificationServiceAreaParameters'
+            examples:
+              isa:
+                summary: ISA criada na ativação, com folga em volta do voo
+                value:
+                  extents:
+                    volume: &id005
+                      outline_polygon:
+                        vertices:
+                        - lat: -23.56
+                          lng: -46.65
+                        - lat: -23.56
+                          lng: -46.62
+                        - lat: -23.53
+                          lng: -46.62
+                        - lat: -23.53
+                          lng: -46.65
+                      altitude_lower:
+                        value: 0
+                        reference: W84
+                        units: M
+                      altitude_upper:
+                        value: 150
+                        reference: W84
+                        units: M
+                    time_start: &id006
+                      value: '2026-11-05T13:58:00Z'
+                      format: RFC3339
+                    time_end:
+                      value: '2026-11-05T14:40:00Z'
+                      format: RFC3339
+                  uss_base_url: https://uss.empresa-a.com.br/rid
+        required: true
+      tags:
+      - Identification Service Areas (Remote ID)
+      operationId: createIdentificationServiceArea
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PutIdentificationServiceAreaResponse'
+              examples:
+                criada:
+                  summary: ISA criada; guarde a version e notifique o subscriber
+                  value:
+                    service_area: *id004
+                    subscribers:
+                    - url: https://uss.empresa-b.com.br/rid
+                      subscriptions:
+                      - subscription_id: 4d7e9a1c-2b3f-4a5d-8e6c-7f9b1d3a5c8e
+                        notification_index: 3
+          description: A Identification Service Area foi criada com sucesso no DSS.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a Identification Service Area de uma forma não permitida.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        409:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * Já existe uma Identification Service Area com o ID informado, de outro cliente.
+            * Apesar de várias tentativas, o DSS não conseguiu atualizar os dados por causa de outras alterações simultâneas.
+        413:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: A área da Identification Service Area é grande demais.
+      security:
+      - Authority:
+        - rid.service_provider
+      summary: Cria uma ISA
+      description: |
+        **Escopo:** `rid.service_provider`
+
+        Declara que o seu SW-USS passa a servir telemetria Remote ID em uma área. No BR-UTM, a ISA é criada quando a operational intent é ativada, isto é, quando o SW-USS começa a compartilhar telemetria.
+
+        - O `id` é um UUIDv4 gerado pelo seu SW-USS. A criação falha se já existir uma ISA com o mesmo ID.
+        - Guarde a `version` devolvida em `service_area.version`: ela é necessária para atualizar ou remover a ISA.
+        - `time_end` é obrigatório. Sem `time_start`, vale o momento atual; um `time_start` mais de 5 minutos no passado é rejeitado.
+        - O BR-UTM não define período de retenção da ISA: `time_end` pode ser o fim do voo.
+        - Notifique os SW-USS listados em `subscribers` com `POST /uss/identification_service_areas/{id}`.
+  /rid/v2/dss/identification_service_areas/{id}/{version}:
+    summary: Uma versão específica de uma Identification Service Area no DSS.
+    parameters:
+    - name: id
+      description: EntityUUID da Identification Service Area.
+      schema:
+        $ref: '#/components/schemas/EntityUUID'
+      in: path
+      required: true
+    - name: version
+      description: 'Versão atual, como o DSS a devolveu no campo `version` (na criação, na última atualização ou num `GET`). A `version` é um texto opaco gerado pelo DSS, que muda a cada gravação (hoje, o instante da gravação em nanossegundos, escrito em base 32, ex.: `1hp9apg58umv8`). Envie exatamente o valor recebido, sem interpretá-lo.'
+      schema:
+        type: string
+      in: path
+      required: true
+      example: 1hp9apg58umv8
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateIdentificationServiceAreaParameters'
+            examples:
+              estender:
+                summary: Estende o fim da ISA em 20 minutos
+                value:
+                  extents:
+                    volume: *id005
+                    time_start: *id006
+                    time_end:
+                      value: '2026-11-05T15:00:00Z'
+                      format: RFC3339
+                  uss_base_url: https://uss.empresa-a.com.br/rid
+        required: true
+      tags:
+      - Identification Service Areas (Remote ID)
+      operationId: updateIdentificationServiceArea
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PutIdentificationServiceAreaResponse'
+              examples:
+                atualizada:
+                  summary: ISA atualizada, com nova version
+                  value:
+                    service_area:
+                      uss_base_url: https://uss.empresa-a.com.br/rid
+                      owner: empresa-a
+                      time_start: *id007
+                      time_end:
+                        value: '2026-11-05T15:00:00Z'
+                        format: RFC3339
+                      version: 1hp9bj1i0as00
+                      id: 5e1f3a7c-9b2d-4c6e-8f0a-1d3b5c7e9f2a
+                    subscribers: []
+          description: A Identification Service Area foi atualizada com sucesso no DSS.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a Identification Service Area de uma forma não permitida.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        409:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * A versão atual da Identification Service Area não corresponde à versão enviada.
+            * Apesar de várias tentativas, o DSS não conseguiu atualizar os dados por causa de outras alterações simultâneas.
+        413:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: A área da Identification Service Area é grande demais.
+      security:
+      - Authority:
+        - rid.service_provider
+      summary: Atualiza uma ISA
+      description: |
+        **Escopo:** `rid.service_provider`
+
+        Substitui a ISA pela nova versão (só a mais recente é guardada); só o dono pode alterar.
+
+        - Envie no caminho a `version` atual da ISA, a devolvida em `service_area.version` na criação, na última atualização ou num `GET`. Se ela não for a atual (outra atualização aconteceu no meio), o DSS responde `409`: faça um `GET`, pegue a `version` atual e repita.
+        - A `version` é um texto opaco gerado pelo DSS, que muda a cada gravação (hoje, o instante da gravação em nanossegundos, escrito em base 32, ex.: `1hp9apg58umv8`). Envie exatamente o valor recebido, sem interpretá-lo.
+        - Depois de atualizar, use a nova `version` da resposta.
+        - Sem `time_start`, o início não muda; sem `time_end`, o fim não muda. Não é permitido mudar `time_start` para antes do momento atual.
+        - O BR-UTM não define período de retenção da ISA: `time_end` pode ser o fim do voo.
+        - Notifique os SW-USS listados em `subscribers` com `POST /uss/identification_service_areas/{id}`.
+    delete:
+      tags:
+      - Identification Service Areas (Remote ID)
+      operationId: deleteIdentificationServiceArea
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteIdentificationServiceAreaResponse'
+          description: A Identification Service Area foi removida do DSS com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+            * A Identification Service Area não pertence ao cliente que pediu a remoção.
+        404:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: A entidade não pôde ser removida porque não foi encontrada.
+        409:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * A versão atual da Identification Service Area não corresponde à versão enviada.
+            * Apesar de várias tentativas, o DSS não conseguiu atualizar os dados por causa de outras alterações simultâneas.
+      security:
+      - Authority:
+        - rid.service_provider
+      summary: Remove uma ISA
+      description: |
+        **Escopo:** `rid.service_provider`
+
+        Remove a Identification Service Area; só o dono pode remover. Envie no caminho a `version` atual, a devolvida em `service_area.version` na criação, na última atualização ou num `GET` (`409` se não for a atual). Não há período de retenção da ISA: ela pode ser removida logo ao fim do voo.
+
+        Notifique os SW-USS listados em `subscribers` com `POST /uss/identification_service_areas/{id}`.
+  /rid/v2/dss/subscriptions:
+    summary: Subscriptions para receber atualizações do espaço aéreo em um volume de interesse.
+    get:
+      tags:
+      - Subscriptions (Remote ID)
+      operationId: searchSubscriptions
+      parameters:
+      - name: area
+        description: 'Área em que as subscriptions serão buscadas. Algumas subscriptions próximas, mas totalmente fora desta área, também podem ser devolvidas. Não repita o primeiro ponto no fim: o DSS fecha o polígono sozinho e rejeita (`400`) uma área cujo último ponto repete o primeiro.'
+        schema:
+          $ref: '#/components/schemas/GeoPolygonString'
+        in: query
+        required: true
+        example: -23.55,-46.64,-23.55,-46.63,-23.54,-46.63,-23.54,-46.64
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchSubscriptionsResponse'
+          description: As subscriptions foram obtidas com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        413:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: A área solicitada é grande demais.
+      security:
+      - Authority:
+        - rid.display_provider
+      summary: Busca as suas subscriptions do Remote ID em uma área
+      description: |
+        **Escopo:** `rid.display_provider`
+
+        Devolve as subscriptions **do próprio cliente** que se sobrepõem a `area`. Serve para recuperar subscriptions perdidas ou resolver o erro de excesso de subscriptions numa área.
+
+        As notificações de subscription só acontecem quando entidades do DSS são criadas, alteradas ou removidas, e trazem apenas as informações da entidade; não transportam outros dados, como telemetria do Remote ID.
+  /rid/v2/dss/subscriptions/{id}:
+    summary: Subscription para receber atualizações do espaço aéreo em um volume de interesse.
+    parameters:
+    - name: id
+      description: SubscriptionUUID da subscription.
+      schema:
+        $ref: '#/components/schemas/SubscriptionUUID'
+      in: path
+      required: true
+    get:
+      tags:
+      - Subscriptions (Remote ID)
+      operationId: getRidSubscription
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidGetSubscriptionResponse'
+          description: A subscription foi obtida com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        404:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: Não existe subscription com o ID informado.
+      security:
+      - Authority:
+        - rid.display_provider
+      - Authority:
+        - rid.service_provider
+      summary: Obtém uma subscription do Remote ID
+      description: |
+        **Escopos aceitos** (qualquer uma das opções): `rid.display_provider` ou `rid.service_provider`
+
+        Verifica a existência, a validade e o estado de uma subscription.
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSubscriptionParameters'
+        required: true
+      tags:
+      - Subscriptions (Remote ID)
+      operationId: createRidSubscription
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidPutSubscriptionResponse'
+          description: A subscription foi criada com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a subscription de uma forma não permitida.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |-
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint ou à requisição.
+        409:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * Já existe uma subscription com o ID informado, de outro cliente.
+            * Apesar de várias tentativas, o DSS não conseguiu atualizar os dados por causa de outras alterações simultâneas.
+        429:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            O cliente já tem subscriptions demais na área em que pediu uma nova. Para corrigir, consulte `GET /rid/v2/dss/subscriptions` e veja quais subscriptions contam para o limite. Em geral isso não acontece, porque o limite fica acima do que um cliente que agrega suas subscriptions de forma razoável precisaria. O limite existe para conter a carga do DSS e seria atingido, por exemplo, por um Display Provider grande que criasse uma subscription para cada visualização de cada usuário.
+
+            No DSS do BR-UTM, o limite é de 10 subscriptions do mesmo cliente em uma mesma célula S2.
+      security:
+      - Authority:
+        - rid.display_provider
+      summary: Cria uma subscription do Remote ID
+      description: |
+        **Escopo:** `rid.display_provider`
+
+        Pede ao DSS notificações de ISAs criadas, alteradas ou removidas em uma área. Usado por quem consome telemetria (Display Provider).
+
+        - A criação falha se já existir uma subscription com o mesmo ID.
+        - O intervalo entre `time_start` e `time_end` é de no máximo 24 horas; sem `time_end`, o DSS usa `time_start` + 24 h. Um `time_start` mais de 5 minutos no passado é rejeitado.
+        - Cada cliente pode ter no máximo 10 subscriptions em uma mesma célula S2 (`429`).
+        - A resposta já traz as ISAs que existem na área naquele momento.
+
+        As notificações de subscription só acontecem quando entidades do DSS são criadas, alteradas ou removidas, e trazem apenas as informações da entidade; não transportam outros dados, como telemetria do Remote ID.
+  /rid/v2/dss/subscriptions/{id}/{version}:
+    summary: Versão específica de uma subscription para receber atualizações do espaço aéreo em um volume de interesse.
+    parameters:
+    - name: id
+      description: SubscriptionUUID da subscription.
+      schema:
+        $ref: '#/components/schemas/SubscriptionUUID'
+      in: path
+      required: true
+    - name: version
+      description: 'Versão atual, como o DSS a devolveu no campo `version` (na criação, na última atualização ou num `GET`). A `version` é um texto opaco gerado pelo DSS, que muda a cada gravação (hoje, o instante da gravação em nanossegundos, escrito em base 32, ex.: `1hp9apg58umv8`). Envie exatamente o valor recebido, sem interpretá-lo.'
+      schema:
+        type: string
+      in: path
+      required: true
+      example: 1hp97ka13ito0
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateSubscriptionParameters'
+        required: true
+      tags:
+      - Subscriptions (Remote ID)
+      operationId: updateRidSubscription
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidPutSubscriptionResponse'
+          description: A subscription foi atualizada com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+            * A requisição tentou alterar a subscription de uma forma não permitida.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |-
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint ou à requisição.
+        409:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * A versão atual da subscription não corresponde à versão enviada.
+            * Apesar de várias tentativas, o DSS não conseguiu atualizar os dados por causa de outras alterações simultâneas.
+        429:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            O cliente já tem subscriptions demais na área em que pediu uma nova. Para corrigir, consulte `GET /rid/v2/dss/subscriptions` e veja quais subscriptions contam para o limite. Em geral isso não acontece, porque o limite fica acima do que um cliente que agrega suas subscriptions de forma razoável precisaria. O limite existe para conter a carga do DSS e seria atingido, por exemplo, por um Display Provider grande que criasse uma subscription para cada visualização de cada usuário.
+
+            No DSS do BR-UTM, o limite é de 10 subscriptions do mesmo cliente em uma mesma célula S2.
+      security:
+      - Authority:
+        - rid.display_provider
+      summary: Atualiza uma subscription do Remote ID
+      description: |
+        **Escopo:** `rid.display_provider`
+
+        Substitui a subscription pela nova versão (só a mais recente é guardada). Envie no caminho a `version` atual, a devolvida em `subscription.version` na criação, na última atualização ou num `GET` (`409` se não for a atual); só o dono pode alterar. Valem os mesmos limites de tempo da criação.
+
+        As notificações de subscription só acontecem quando entidades do DSS são criadas, alteradas ou removidas, e trazem apenas as informações da entidade; não transportam outros dados, como telemetria do Remote ID.
+    delete:
+      tags:
+      - Subscriptions (Remote ID)
+      operationId: deleteRidSubscription
+      responses:
+        200:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidDeleteSubscriptionResponse'
+          description: A subscription foi removida com sucesso.
+        400:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        401:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        403:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+            * A entidade não pertence ao cliente que pediu a remoção.
+        404:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: A subscription não pôde ser removida porque não foi encontrada.
+        409:
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RidErrorResponse'
+          description: |
+            * A versão atual da subscription não corresponde à versão enviada.
+            * Apesar de várias tentativas, o DSS não conseguiu atualizar os dados por causa de outras alterações simultâneas.
+      security:
+      - Authority:
+        - rid.display_provider
+      summary: Remove uma subscription do Remote ID
+      description: |
+        **Escopo:** `rid.display_provider`
+
+        Remove a subscription. Envie no caminho a `version` atual, a devolvida em `subscription.version` na criação, na última atualização ou num `GET` (`409` se não for a atual); só o dono pode remover.
+components:
+  securitySchemes:
+    Authority:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: /token
+          scopes:
+            utm.strategic_coordination: >-
+              O cliente pode executar as ações do papel Strategic Coordination, incluindo a detecção estratégica de conflitos.
+            utm.conformance_monitoring_sa: >-
+              O cliente pode executar as ações do papel Conformance Monitoring for Situational Awareness (CMSA).
+            utm.constraint_processing: >-
+              O cliente pode ler referências de constraints no DSS e os detalhes nos SW-USS parceiros, conforme o papel Constraint Processing.
+            utm.constraint_management: >-
+              O cliente pode gerenciar (criar, editar e remover) constraints, conforme o papel Constraint Management.
+            utm.availability_arbitration: >-
+              O cliente pode definir o estado de disponibilidade dos SW-USS no DSS.
+            rid.display_provider: O cliente pode consultar, ler ou criar subscriptions de Identification Service Areas do Remote ID. Um Display Provider deve receber este escopo quando o pedir.
+            rid.service_provider: O cliente pode criar, editar e remover Identification Service Areas do Remote ID. Um Service Provider deve receber este escopo quando o pedir.
+      description: |
+        Token de acesso JWT emitido pelo Auth Server do BR-UTM em `GET /token` (ver `token.yaml`), a partir da chave de API da empresa. O tipo `oauth2` é usado aqui só para declarar os escopos de cada operação: o BR-UTM não usa o fluxo OAuth *client credentials*.
+
+        Envie o token no header `Authorization: Bearer <token>`. O DSS verifica:
+
+        * a assinatura RS256, com a chave pública do Auth Server;
+        * `aud`: deve ser um dos audiences aceitos pelo DSS (o domínio do DSS);
+        * `sub` e `iss` preenchidos, e `exp` no máximo 1 hora no futuro;
+        * `scope`: deve conter todos os escopos de pelo menos uma das alternativas listadas em `security` na operação.
+
+        O `sub` do token identifica a empresa e vira o `manager` (ou `owner`) das entidades que ela cria no DSS.
+  schemas:
+    UUIDv4Format:
+      description: >-
+        Texto no formato de um UUID versão 4, conforme a RFC 4122.
+      maxLength: 36
+      minLength: 36
+      type: string
+      format: uuid
+      pattern: >-
+        ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$
+      example: 03e5572a-f733-49af-bc14-8a18bd53ee39
+    EntityID:
+      description: >-
+        Identificador de uma entidade comunicada pelo DSS, no formato UUIDv4.
+      anyOf:
+      - $ref: '#/components/schemas/UUIDv4Format'
+      example: 2f8343be-6482-4d1b-a474-16847e01af1e
+    EntityOVN:
+      title: EntityOVN
+      description: >-
+        Token associado a uma versão específica de uma entidade UTM, criado pelo DSS quando a referência da entidade é criada ou alterada, e entregue ao cliente que fez a alteração. O DSS guarda o EntityOVN de forma privada e o compara com os itens da `key` enviada nas escritas no espaço aéreo. O cliente também informa o EntityOVN sempre que transmite as informações completas da entidade (em um GET ou em uma notificação de subscription).
+      type: string
+      minLength: 16
+      maxLength: 128
+      example: v.v5qNvwU.VccnOCgBA-CEfqltpTC-3qN-2iKbRusEQ_
+    EntityVersion:
+      title: EntityVersion
+      description: >-
+        Versão numérica da entidade, incrementada a cada alteração, mesmo que nenhum campo mude. Um SW-USS que já tem os detalhes de uma versão não precisa buscá-los de novo até a versão mudar.
+      type: integer
+      format: int32
+      example: 1
+    SubscriptionID:
+      description: >-
+        Identificador de uma subscription comunicada pelo DSS, no formato UUIDv4.
+      anyOf:
+      - $ref: '#/components/schemas/UUIDv4Format'
+      example: 78ea3fe8-71c2-4f5c-9b44-9c02f5563c6f
+    Key:
+      description: >-
+        Prova de que o cliente obteve o conteúdo mais recente do espaço aéreo, usada para garantir que escritas no DSS só aconteçam quando esse conteúdo é conhecido (foi lido). O cliente deve enviar uma `key` atual, montada a partir de leituras anteriores, das consultas de informações completas que se seguiram e, opcionalmente, de notificações de subscriptions. O conteúdo desta estrutura, uma lista de OVNs, é gerado pelo cliente.
+      type: array
+      items:
+        $ref: '#/components/schemas/EntityOVN'
+      default: []
+    Time:
+      required:
+      - value
+      - format
+      type: object
+      properties:
+        value:
+          type: string
+          description: >-
+            Data e hora no formato RFC 3339. O fuso horário deve ser 'Z'.
+          format: date-time
+          example: '2026-11-05T14:00:00Z'
+        format:
+          type: string
+          enum:
+          - RFC3339
+    Radius:
+      required:
+      - value
+      - units
+      type: object
+      properties:
+        value:
+          format: float
+          description: >-
+            Distância a partir do centro de uma área circular, sobre o elipsoide WGS84.
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+          example: 300
+        units:
+          type: string
+          description: >-
+            Unidades compatíveis com FIXM. No UTM, só metros ("M") são aceitos.
+          enum:
+          - M
+    Altitude:
+      type: object
+      required:
+      - value
+      - reference
+      - units
+      properties:
+        value:
+          description: >-
+            Valor numérico da altitude. Os valores mínimo e máximo servem como verificação de sanidade e podem ser revistos à medida que novas unidades ou referenciais forem permitidos.
+          type: number
+          format: double
+          minimum: -8000
+          exclusiveMinimum: false
+          maximum: 100000
+          exclusiveMaximum: false
+          example: 120
+        reference:
+          description: >-
+            Código do referencial da distância vertical. Ver AIXM 5.1 e FIXM 4.2.0. Hoje o UTM só aceita WGS84, sem planos imediatos de aceitar outros. FIXM e AIXM aceitam 'SFC', equivalente a AGL.
+          type: string
+          enum:
+          - W84
+        units:
+          description: >-
+            Unidade usada para expressar a altitude. Ver FIXM 4.2. Hoje o UTM só aceita metros, sem planos imediatos de aceitar outras.
+          type: string
+          enum:
+          - M
+    Latitude:
+      description: >-
+        Graus de latitude ao norte do equador, em relação ao elipsoide WGS84.
+      maximum: 90
+      exclusiveMaximum: false
+      minimum: -90
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: -23.5505
+    Longitude:
+      description: >-
+        Graus de longitude a leste do meridiano de Greenwich, em relação ao elipsoide WGS84.
+      minimum: -180
+      exclusiveMaximum: false
+      maximum: 180
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: -46.6333
+    Polygon:
+      description: >-
+        Área fechada sobre a Terra. As arestas do polígono são os caminhos mais curtos entre vértices consecutivos. Isso significa, por exemplo, que a aresta entre dois pontos de mesma latitude em geral não fica sobre essa latitude. A ordem dos vértices deve ser interpretada como a que produz a menor área. As arestas não podem se cruzar e os vértices não podem se repetir; em particular, o último vértice não pode ser igual ao primeiro.
+      required:
+      - vertices
+      type: object
+      properties:
+        vertices:
+          minItems: 3
+          type: array
+          items:
+            $ref: '#/components/schemas/LatLngPoint'
+    LatLngPoint:
+      description: Ponto na superfície da Terra.
+      required:
+      - lat
+      - lng
+      type: object
+      properties:
+        lng:
+          $ref: '#/components/schemas/Longitude'
+        lat:
+          $ref: '#/components/schemas/Latitude'
+    Circle:
+      description: Área circular na superfície da Terra.
+      type: object
+      properties:
+        center:
+          $ref: '#/components/schemas/LatLngPoint'
+        radius:
+          $ref: '#/components/schemas/Radius'
+    Volume3D:
+      description: >-
+        Volume geográfico tridimensional formado pela extrusão vertical de uma forma. Deve ser informado exatamente um contorno.
+      type: object
+      properties:
+        outline_circle:
+          anyOf:
+          - $ref: '#/components/schemas/Circle'
+          description: Forma geográfica circular na superfície da Terra.
+        outline_polygon:
+          anyOf:
+          - $ref: '#/components/schemas/Polygon'
+          description: >-
+            Forma geográfica poligonal na superfície da Terra.
+        altitude_lower:
+          description: >-
+            Altitude mínima do volume. Se informada, deve ser menor que `altitude_upper`.
+          anyOf:
+          - $ref: '#/components/schemas/Altitude'
+        altitude_upper:
+          description: >-
+            Altitude máxima do volume. Se informada, deve ser maior que `altitude_lower`.
+          anyOf:
+          - $ref: '#/components/schemas/Altitude'
+    Volume4D:
+      description: Bloco contínuo de espaço-tempo geográfico.
+      required:
+      - volume
+      type: object
+      properties:
+        volume:
+          $ref: '#/components/schemas/Volume3D'
+        time_start:
+          description: Início do volume. Deve ser anterior a `time_end`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: Fim do volume. Deve ser posterior a `time_start`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+    ErrorResponse:
+      description: >-
+        Texto legível devolvido quando uma transação entre SW-USS e DSS resulta em erro.
+      type: object
+      properties:
+        message:
+          description: >-
+            Mensagem legível que indica o erro e/ou o motivo.
+          type: string
+          example: OperationalIntents may not end in the past
+    SubscriptionState:
+      description: >-
+        Estado da subscription que motivou o envio de uma notificação.
+      required:
+      - subscription_id
+      - notification_index
+      type: object
+      properties:
+        subscription_id:
+          $ref: '#/components/schemas/SubscriptionID'
+        notification_index:
+          $ref: '#/components/schemas/SubscriptionNotificationIndex'
+    SubscriberToNotify:
+      description: >-
+        Subscriber que deve ser notificado de uma mudança no espaço aéreo. O DSS informa os subscribers ao cliente que alterou o espaço aéreo, e cabe a esse cliente enviar a notificação ao SW-USS indicado, de acordo com a alteração feita.
+      required:
+      - subscriptions
+      - uss_base_url
+      type: object
+      properties:
+        subscriptions:
+          description: Subscription(s) que motivaram esta notificação.
+          type: array
+          items:
+            $ref: '#/components/schemas/SubscriptionState'
+          minItems: 1
+        uss_base_url:
+          $ref: '#/components/schemas/SubscriptionUssBaseURL'
+    Subscription:
+      description: >-
+        Área geográfica pela qual um cliente tem interesse contínuo (por exemplo, uma "área de planejamento").
+      required:
+      - id
+      - version
+      - notification_index
+      - uss_base_url
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/SubscriptionID'
+        version:
+          description: >-
+            Versão da subscription, alterada pelo DSS sempre que um SW-USS altera a subscription. O incremento do `notification_index` pelo DSS não gera nova versão. O SW-USS deve informar esta versão ao alterar uma subscription existente, para garantir consistência em leituras-alterações-escritas e em sistemas distribuídos.
+          type: string
+          example: RrDXHiEknrlVXOo-hUYyT1wi-jTTcpZbk9UI.fJbiac_
+        notification_index:
+          $ref: '#/components/schemas/SubscriptionNotificationIndex'
+        time_start:
+          description: >-
+            Se informado, a subscription não recebe notificações de mudanças no espaço aéreo que ocorram inteiramente antes deste instante.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: >-
+            Se informado, a subscription não recebe notificações de mudanças no espaço aéreo que ocorram inteiramente depois deste instante.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        uss_base_url:
+          $ref: '#/components/schemas/SubscriptionUssBaseURL'
+        notify_for_operational_intents:
+          description: >-
+            Se verdadeiro, gera notificações quando operational intents são criadas, alteradas ou removidas. Caso contrário, mudanças em operational intents não geram notificações. Qualquer um dos escopos aceitos pela operação (`utm.strategic_coordination` ou `utm.constraint_processing`) permite ativar esta opção.
+          type: boolean
+          default: false
+        notify_for_constraints:
+          description: >-
+            Se verdadeiro, gera notificações quando constraints são criadas, alteradas ou removidas. Caso contrário, mudanças em constraints não geram notificações. Qualquer um dos escopos aceitos pela operação (`utm.strategic_coordination` ou `utm.constraint_processing`) permite ativar esta opção.
+          type: boolean
+          default: false
+        implicit_subscription:
+          description: >-
+            Verdadeiro se a subscription foi criada implicitamente pelo DSS junto com uma operational intent, e por isso deve ser removida pelo DSS quando essa operational intent for removida.
+          type: boolean
+          default: false
+        dependent_operational_intents:
+          description: >-
+            IDs das operational intents que dependem desta subscription.
+          type: array
+          items:
+            $ref: '#/components/schemas/EntityID'
+          default: []
+    SubscriptionNotificationIndex:
+      format: int32
+      description: >-
+        Contador das notificações enviadas para uma subscription, para que o subscriber perceba com mais facilidade notificações perdidas.
+      type: integer
+      minimum: 0
+      exclusiveMinimum: false
+      default: 0
+    QuerySubscriptionParameters:
+      description: >-
+        Parâmetros de uma requisição para buscar subscriptions que atendam aos critérios informados.
+      type: object
+      properties:
+        area_of_interest:
+          $ref: '#/components/schemas/Volume4D'
+    QuerySubscriptionsResponse:
+      description: >-
+        Resposta do DSS a uma consulta de subscriptions em uma área geográfica.
+      required:
+      - subscriptions
+      type: object
+      properties:
+        subscriptions:
+          description: >-
+            Subscriptions que se sobrepõem à área geográfica informada.
+          type: array
+          items:
+            $ref: '#/components/schemas/Subscription'
+          default: []
+    GetSubscriptionResponse:
+      description: >-
+        Resposta do DSS a uma requisição da subscription com o ID informado.
+      required:
+      - subscription
+      type: object
+      properties:
+        subscription:
+          $ref: '#/components/schemas/Subscription'
+    PutSubscriptionParameters:
+      description: >-
+        Parâmetros de uma requisição para criar ou atualizar uma subscription no DSS. Pelo menos um tipo de notificação deve ser pedido.
+      required:
+      - extents
+      - uss_base_url
+      type: object
+      properties:
+        extents:
+          description: |
+            Volumes espaço-temporais da área de interesse.
+            A subscription é removida automaticamente depois do seu fim, se não for renovada antes. Se o fim não for informado, o DSS escolhe o valor. Se o início não for informado, vale o momento em que a requisição é processada. O fim não pode estar no passado.
+            Algumas entidades que geram notificações podem estar inteiramente fora da área pedida.
+          anyOf:
+          - $ref: '#/components/schemas/Volume4D'
+        uss_base_url:
+          $ref: '#/components/schemas/SubscriptionUssBaseURL'
+        notify_for_operational_intents:
+          description: >-
+            Se verdadeiro, gera notificações quando operational intents são criadas, alteradas ou removidas. Caso contrário, mudanças em operational intents não geram notificações. Qualquer um dos escopos aceitos pela operação (`utm.strategic_coordination` ou `utm.constraint_processing`) permite ativar esta opção.
+          type: boolean
+          default: false
+        notify_for_constraints:
+          description: >-
+            Se verdadeiro, gera notificações quando constraints são criadas, alteradas ou removidas. Caso contrário, mudanças em constraints não geram notificações. Qualquer um dos escopos aceitos pela operação (`utm.strategic_coordination` ou `utm.constraint_processing`) permite ativar esta opção.
+          type: boolean
+          default: false
+    SubscriptionUssBaseURL:
+      description: >-
+        URL base da implementação, no SW-USS, das partes da API entre SW-USS necessárias para receber as notificações pedidas por esta subscription.
+      anyOf:
+      - $ref: '#/components/schemas/UssBaseURL'
+    PutSubscriptionResponse:
+      description: Resposta a uma requisição de criação ou atualização de subscription.
+      required:
+      - subscription
+      type: object
+      properties:
+        subscription:
+          $ref: '#/components/schemas/Subscription'
+        operational_intent_references:
+          description: >-
+            Operational intents dentro ou perto da área da subscription no momento da criação ou atualização, se `notify_for_operational_intents` for verdadeiro.
+          type: array
+          items:
+            $ref: '#/components/schemas/OperationalIntentReference'
+          default: []
+        constraint_references:
+          description: >-
+            Constraints dentro ou perto da área da subscription no momento da criação ou atualização, se `notify_for_constraints` for verdadeiro.
+          type: array
+          items:
+            $ref: '#/components/schemas/ConstraintReference'
+          default: []
+    DeleteSubscriptionResponse:
+      description: Resposta a uma remoção de subscription bem-sucedida.
+      required:
+      - subscription
+      type: object
+      properties:
+        subscription:
+          $ref: '#/components/schemas/Subscription'
+    UssBaseURL:
+      description: >-
+        URL base da implementação, no SW-USS, de parte ou de toda a API entre SW-USS. A URL completa de um recurso é montada acrescentando, por exemplo, `/uss/v1/{resource}/{id}` a esta URL base. Por isso, ela não pode terminar com '/'. O host é um domínio, não um endereço IP, porque o `intended_audience` dos tokens para este SW-USS é esse domínio, sem a porta.
+      type: string
+      example: https://uss.empresa-a.com.br/utm
+    OperationalIntentState:
+      description: |
+        Estado de uma operational intent.
+        'Accepted': a operational intent foi criada e compartilhada, mas ainda não está em uso (detalhes na norma).
+        A requisição de criação ou atualização desta operational intent reference deve incluir uma `key` com os OVNs de todas as entidades relevantes.
+        'Activated': a operational intent está em uso (detalhes na norma).
+        A requisição de criação ou atualização desta operational intent reference deve incluir uma `key` com os OVNs de todas as entidades relevantes.
+        'Nonconforming': a UA está temporariamente fora dos seus volumes, mas espera-se que a situação seja recuperável (detalhes na norma).
+        Neste estado, o endpoint `/uss/v1/operational_intents/{entityid}/telemetry` da API entre SW-USS deve responder, se disponível, às consultas dos demais SW-USS. A requisição de criação ou atualização pode omitir a `key`, porque a operational intent está sendo ajustada ao voo realizado e não necessariamente consegue ser desconflitada.
+        'Contingent': considera-se que a UA não consegue mais, de forma irrecuperável, cumprir a sua operational intent (detalhes na norma).
+        Neste estado, o endpoint `/uss/v1/operational_intents/{entityid}/telemetry` da API entre SW-USS deve responder, se disponível, às consultas dos demais SW-USS. A requisição de criação ou atualização pode omitir a `key`, porque a operational intent está sendo ajustada ao voo realizado e não necessariamente consegue ser desconflitada.
+      type: string
+      enum:
+      - Accepted
+      - Activated
+      - Nonconforming
+      - Contingent
+    OperationalIntentReference:
+      description: >-
+        Informações gerais de uma operational intent planejada ou ativa, com a URL do SW-USS em que os detalhes podem ser consultados. Observação: o `ovn` só é devolvido ao SW-USS que criou a operational intent, NUNCA aos demais (para eles, o DSS do BR-UTM devolve o texto `Available from USS`).
+      required:
+      - id
+      - manager
+      - uss_availability
+      - version
+      - state
+      - time_start
+      - time_end
+      - uss_base_url
+      - subscription_id
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/EntityID'
+        manager:
+          type: string
+          example: empresa-a
+          description: >-
+            Preenchido pelo DSS com o ID do cliente que criou a entidade (o `sub` do token de acesso). Usado pelo DSS para restringir alterações e remoções ao `manager`, e pelos SW-USS para rejeitar notificações de operational intent enviadas por um SW-USS que não a gerencia.
+        uss_availability:
+          $ref: '#/components/schemas/UssAvailabilityState'
+        version:
+          $ref: '#/components/schemas/EntityVersion'
+        state:
+          $ref: '#/components/schemas/OperationalIntentState'
+        ovn:
+          description: >-
+            OVN desta operational intent. Só é preenchido quando a OperationalIntentReference é gerenciada pelo SW-USS que a consulta ou a fornece. Caso contrário, o SW-USS deve obter o OVN nos detalhes fornecidos pelo SW-USS que a gerencia.
+          anyOf:
+          - $ref: '#/components/schemas/EntityOVN'
+        time_start:
+          description: Início da operational intent.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: Fim da operational intent.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        uss_base_url:
+          $ref: '#/components/schemas/OperationalIntentUssBaseURL'
+        subscription_id:
+          description: >-
+            ID da subscription que garante que o `manager` da operational intent receba as atualizações relevantes do espaço aéreo.
+          anyOf:
+          - $ref: '#/components/schemas/SubscriptionID'
+    OperationalIntentUssBaseURL:
+      description: >-
+        URL base da implementação, no SW-USS, das partes da API entre SW-USS necessárias para fornecer os detalhes desta operational intent e, se for o caso, a telemetria em não conformidade ou contingência.
+      anyOf:
+      - $ref: '#/components/schemas/UssBaseURL'
+    PutOperationalIntentReferenceParameters:
+      description: >-
+        Parâmetros de uma requisição para criar uma OperationalIntentReference no DSS. Uma subscription para mudanças que se sobreponham a este volume pode ser criada implicitamente, mas isso pode ser substituído informando o `subscription_id` (opcional) a usar. Observação: a subscription implícita é gerenciada pelo DSS, não pelo SW-USS.
+      required:
+      - extents
+      - state
+      - uss_base_url
+      type: object
+      properties:
+        extents:
+          description: |
+            Volumes espaço-temporais que delimitam esta operational intent.
+            Início e fim, e altitudes mínima e máxima, são obrigatórios em cada volume. O fim não pode estar no passado. Todos os volumes, nominais e off-nominal, devem estar contidos nestes volumes, que não precisam coincidir com os volumes exatos da operational intent: um único volume envolvente basta, por exemplo.
+          type: array
+          items:
+            $ref: '#/components/schemas/Volume4D'
+          minItems: 1
+        key:
+          description: >-
+            Prova de que o SW-USS que cria ou altera esta operational intent conhecia o estado atual do espaço aéreo e, portanto, de que a operational intent está desconflitada de todas as entidades relevantes. Não é obrigatória ao declarar a operational intent `Nonconforming` ou `Contingent`, nem quando não há entidades relevantes no espaço aéreo; nos demais casos, é obrigatória. OVNs de constraints são exigidos se, e somente se, o SW-USS que gerencia a operational intent exerce o papel de Constraint Processing, o que é indicado pela subscription associada à operational intent gerar notificações de constraints. A `key` não precisa conter o OVN da própria operational intent que está sendo alterada.
+          anyOf:
+          - $ref: '#/components/schemas/Key'
+        state:
+          $ref: '#/components/schemas/OperationalIntentState'
+        uss_base_url:
+          $ref: '#/components/schemas/OperationalIntentUssBaseURL'
+        subscription_id:
+          description: >-
+            ID de uma subscription existente que o SW-USS usará para manter o operador informado sobre atualizações relevantes do espaço aéreo. Se este campo não for informado com a operational intent em `Activated`, `Nonconforming` ou `Contingent`, o campo `new_subscription` deve ser informado, para que a operational intent possa ser notificada. A subscription indicada deve cobrir pelo menos a área da operational intent e gerar notificações de operational intents.
+          anyOf:
+          - $ref: '#/components/schemas/EntityID'
+        new_subscription:
+          description: >-
+            Se `subscription_id` não for informado e a operational intent estiver em `Activated`, `Nonconforming` ou `Contingent`, este campo deve ser preenchido. Quando preenchido, uma subscription implícita é criada e associada à operational intent, e em geral é removida automaticamente quando a operational intent é removida.
+          anyOf:
+          - $ref: '#/components/schemas/ImplicitSubscriptionParameters'
+    ImplicitSubscriptionParameters:
+      description: >-
+        Informações necessárias para criar uma subscription que atenda às necessidades de notificação de uma única operational intent.
+      type: object
+      required:
+      - uss_base_url
+      properties:
+        uss_base_url:
+          description: >-
+            URL base da implementação, no SW-USS, das partes da API entre SW-USS necessárias para receber as notificações de que a operational intent precisa. Isso inclui, no mínimo, notificações de mudanças relevantes em operational intents.
+          anyOf:
+          - $ref: '#/components/schemas/SubscriptionUssBaseURL'
+        notify_for_constraints:
+          description: >-
+            Verdadeiro se a subscription desta operational intent deve gerar notificações quando constraints mudarem. Caso contrário, mudanças em constraints não geram notificações. É necessário o escopo `utm.constraint_processing` para ativar esta opção, e um SW-USS que exerce o papel de Constraint Processing deve ativá-la.
+          type: boolean
+          default: false
+    GetOperationalIntentReferenceResponse:
+      description: >-
+        Resposta do DSS a uma requisição da OperationalIntentReference com o ID informado.
+      required:
+      - operational_intent_reference
+      type: object
+      properties:
+        operational_intent_reference:
+          $ref: '#/components/schemas/OperationalIntentReference'
+    ChangeOperationalIntentReferenceResponse:
+      description: >-
+        Resposta a uma requisição de criação, atualização ou remoção de uma OperationalIntentReference no DSS.
+      required:
+      - subscribers
+      - operational_intent_reference
+      type: object
+      properties:
+        subscribers:
+          description: >-
+            Subscribers do DSS que este cliente agora tem a obrigação de notificar sobre as mudanças que acabou de fazer na operational intent. O cliente deve chamar POST em cada URL informada, conforme a API entre SW-USS `/uss/v1/operational_intents`. As subscriptions do próprio cliente também aparecem nesta lista.
+          type: array
+          items:
+            $ref: '#/components/schemas/SubscriberToNotify'
+          default: []
+        operational_intent_reference:
+          $ref: '#/components/schemas/OperationalIntentReference'
+    QueryOperationalIntentReferenceParameters:
+      description: >-
+        Parâmetros de uma requisição para buscar OperationalIntentReferences que atendam aos critérios informados.
+      type: object
+      properties:
+        area_of_interest:
+          $ref: '#/components/schemas/Volume4D'
+    QueryOperationalIntentReferenceResponse:
+      description: >-
+        Resposta do DSS a uma consulta de OperationalIntentReferences em uma área de interesse.
+      required:
+      - operational_intent_references
+      type: object
+      properties:
+        operational_intent_references:
+          description: OperationalIntentReferences na área de interesse.
+          type: array
+          items:
+            $ref: '#/components/schemas/OperationalIntentReference'
+          default: []
+    ConstraintReference:
+      description: >-
+        Uma ConstraintReference (área em que existe uma constraint, com outras informações gerais, mas sem os detalhes). O DSS informa apenas estas referências; os clientes trocam os detalhes e as informações adicionais diretamente entre si (peer-to-peer).
+      required:
+      - id
+      - manager
+      - uss_availability
+      - version
+      - time_start
+      - time_end
+      - uss_base_url
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/EntityID'
+        manager:
+          type: string
+          example: decea
+          description: >-
+            Preenchido pelo DSS com o ID do cliente que criou a entidade (o `sub` do token de acesso). Usado pelo DSS para restringir alterações e remoções ao `manager`, e pelos SW-USS para rejeitar notificações de constraint enviadas por um SW-USS que não a gerencia.
+        uss_availability:
+          $ref: '#/components/schemas/UssAvailabilityState'
+        version:
+          $ref: '#/components/schemas/EntityVersion'
+        ovn:
+          description: >-
+            OVN desta constraint. Só é preenchido quando a ConstraintReference é gerenciada pelo SW-USS que a consulta ou a fornece. Caso contrário, o SW-USS deve obter o OVN nos detalhes fornecidos pelo SW-USS que a gerencia.
+          anyOf:
+          - $ref: '#/components/schemas/EntityOVN'
+        time_start:
+          $ref: '#/components/schemas/Time'
+        time_end:
+          $ref: '#/components/schemas/Time'
+        uss_base_url:
+          $ref: '#/components/schemas/ConstraintUssBaseURL'
+    ConstraintUssBaseURL:
+      description: >-
+        URL base da implementação, no SW-USS, das partes da API entre SW-USS necessárias para fornecer os detalhes desta constraint.
+      anyOf:
+      - $ref: '#/components/schemas/UssBaseURL'
+    PutConstraintReferenceParameters:
+      description: >-
+        Parâmetros de uma requisição para criar ou atualizar uma ConstraintReference no DSS.
+      required:
+      - extents
+      - uss_base_url
+      type: object
+      properties:
+        extents:
+          description: |
+            Volumes espaço-temporais que delimitam esta constraint.
+            O fim não pode estar no passado.
+            Todos os volumes da constraint devem estar contidos nestes volumes, que não precisam coincidir com os volumes exatos da constraint: um único volume envolvente basta, por exemplo.
+          type: array
+          items:
+            $ref: '#/components/schemas/Volume4D'
+          minItems: 1
+        uss_base_url:
+          $ref: '#/components/schemas/ConstraintUssBaseURL'
+    GetConstraintReferenceResponse:
+      description: >-
+        Resposta do DSS a uma requisição da ConstraintReference com o ID informado.
+      required:
+      - constraint_reference
+      type: object
+      properties:
+        constraint_reference:
+          $ref: '#/components/schemas/ConstraintReference'
+    ChangeConstraintReferenceResponse:
+      description: >-
+        Resposta a uma requisição de criação, atualização ou remoção de uma ConstraintReference no DSS.
+      required:
+      - subscribers
+      - constraint_reference
+      type: object
+      properties:
+        subscribers:
+          description: >-
+            Subscribers do DSS que este cliente agora tem a obrigação de notificar sobre as mudanças que acabou de fazer na constraint. O cliente deve chamar POST em cada URL informada, conforme a API entre SW-USS `/uss/v1/constraints`. As subscriptions do próprio cliente também aparecem nesta lista.
+          type: array
+          items:
+            $ref: '#/components/schemas/SubscriberToNotify'
+          default: []
+        constraint_reference:
+          $ref: '#/components/schemas/ConstraintReference'
+    QueryConstraintReferenceParameters:
+      description: >-
+        Parâmetros de uma requisição para buscar ConstraintReferences que atendam aos critérios informados.
+      type: object
+      properties:
+        area_of_interest:
+          $ref: '#/components/schemas/Volume4D'
+    QueryConstraintReferencesResponse:
+      description: >-
+        Resposta do DSS a uma consulta de ConstraintReferences em uma área de interesse.
+      required:
+      - constraint_references
+      type: object
+      properties:
+        constraint_references:
+          description: ConstraintReferences na área de interesse.
+          type: array
+          items:
+            $ref: '#/components/schemas/ConstraintReference'
+          default: []
+    AirspaceConflictResponse:
+      description: Dados devolvidos quando há um conflito no espaço aéreo.
+      type: object
+      properties:
+        message:
+          description: >-
+            Mensagem legível que indica o erro e/ou o motivo.
+          type: string
+          example: Current OVNs not provided for one or more OperationalIntents or Constraints
+        missing_operational_intents:
+          description: >-
+            Operational intent references para as quais não foi enviada prova atual de conhecimento. Se este campo vier preenchido, o SW-USS deve consultar a URL de detalhes de cada uma para obter os detalhes e o OVN correto, acrescentar os OVNs à `key` e repetir a chamada.
+          type: array
+          items:
+            $ref: '#/components/schemas/OperationalIntentReference'
+          default: []
+        missing_constraints:
+          description: >-
+            Constraint references para as quais não foi enviada prova atual de conhecimento. Se este campo vier preenchido, o SW-USS deve consultar a URL de detalhes de cada uma para obter os detalhes e o OVN correto, acrescentar os OVNs à `key` e repetir a chamada.
+          type: array
+          items:
+            $ref: '#/components/schemas/ConstraintReference'
+          default: []
+    UssAvailabilityStatus:
+      type: object
+      required:
+      - uss
+      - availability
+      properties:
+        uss:
+          type: string
+          description: >-
+            ID do cliente (igual ao `sub` dos seus tokens de acesso) do SW-USS a que esta disponibilidade se refere.
+          example: empresa-b
+        availability:
+          $ref: '#/components/schemas/UssAvailabilityState'
+    UssAvailabilityState:
+      type: string
+      enum:
+      - Unknown
+      - Normal
+      - Down
+      description: |
+        Um SW-USS é considerado `Unknown` até que um SW-USS com o escopo de arbitragem de disponibilidade indique outra coisa. Quando a arbitragem determina que um SW-USS não responde adequadamente, ele passa a `Down`.
+        Um SW-USS em `Unknown` tem, no DSS, as mesmas capacidades de um SW-USS em `Normal`. No DSS do BR-UTM, um SW-USS `Down` também mantém essas capacidades: continua podendo criar, alterar e remover as próprias operational intents. O efeito de `Down` está descrito em `PUT /dss/v1/uss_availability/{uss_id}`.
+    SetUssAvailabilityStatusParameters:
+      type: object
+      required:
+      - old_version
+      - availability
+      properties:
+        old_version:
+          type: string
+          default: ''
+          description: >-
+            Versão da disponibilidade do SW-USS a ser alterada, para leituras-alterações-escritas consistentes e novas tentativas consistentes.
+        availability:
+          $ref: '#/components/schemas/UssAvailabilityState'
+    UssAvailabilityStatusResponse:
+      type: object
+      required:
+      - status
+      - version
+      properties:
+        version:
+          type: string
+          description: >-
+            Versão atual da disponibilidade do SW-USS. Usada para alterar a disponibilidade.
+          example: KGjtHT44V-BSZm1dbCD19AR9ssWXfzDgW5TsJVoz0TQ_
+        status:
+          $ref: '#/components/schemas/UssAvailabilityStatus'
+
+    #
+    # Data structures for logging
+    #
+    ExchangeRecord:
+      type: object
+      description: Detalhes de uma troca de requisição e resposta.
+      required:
+      - url
+      - method
+      - recorder_role
+      - request_time
+      - request_source
+      properties:
+        url:
+          type: string
+          description: URL completa da requisição.
+          example: https://uss.empresa-b.com.br/utm/uss/v1/operational_intents
+        method:
+          type: string
+          description: 'Verbo HTTP usado por quem fez a requisição (ex.: "PUT", "GET").'
+          example: POST
+        headers:
+          description: >-
+            Headers da requisição ou da resposta. Deve conter, no mínimo, o header `Authorization`.
+          type: array
+          items:
+            type: string
+          default: []
+          example:
+          - 'Authorization: Bearer <token>'
+          - 'Content-Type: application/json'
+        recorder_role:
+          type: string
+          description: >-
+            Código que indica o papel do SW-USS que registrou a troca: 'Client' (fez a requisição a um SW-USS remoto) ou 'Server' (atendeu a requisição de um SW-USS remoto).
+          enum:
+          - Client
+          - Server
+        request_time:
+          description: Momento em que a requisição foi enviada ou recebida.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        request_body:
+          description: Corpo da requisição enviado ou recebido, codificado em Base64.
+          type: string
+          default: ''
+        response_time:
+          description: Momento em que a resposta foi enviada ou recebida.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        response_body:
+          type: string
+          default: ''
+          description: >-
+            Corpo da resposta enviado ou recebido, codificado em Base64.
+        response_code:
+          type: integer
+          format: int32
+          default: 0
+          description: Código HTTP da resposta enviada ou recebida.
+        problem:
+          type: string
+          description: >-
+            Descrição legível do problema da troca, se houver.
+          example: Sem resposta em 10 segundos
+    ErrorReport:
+      type: object
+      description: Relato que informa um servidor sobre um problema de comunicação.
+      required:
+      - exchange
+      properties:
+        report_id:
+          type: string
+          maxLength: 128
+          description: >-
+            ID atribuído pelo servidor que recebe o relato. Não preencha ao enviar um relato.
+          example: e9b1c3d5-7f2a-4b6c-8d0e-2a4c6e8f0b1d
+        exchange:
+          anyOf:
+          - $ref: '#/components/schemas/ExchangeRecord'
+          description: >-
+            Requisição (feita por este SW-USS) e resposta associadas ao erro.
+    RidCircle:
+      description: Área circular na superfície da Terra.
+      type: object
+      properties:
+        center:
+          $ref: '#/components/schemas/RidLatLngPoint'
+        radius:
+          $ref: '#/components/schemas/Radius'
+    RidVolume3D:
+      description: >-
+        Volume geográfico tridimensional formado pela extrusão vertical de uma forma. Deve ser informado exatamente um contorno.
+      type: object
+      properties:
+        outline_circle:
+          anyOf:
+          - $ref: '#/components/schemas/RidCircle'
+          description: Forma geográfica circular na superfície da Terra.
+        outline_polygon:
+          anyOf:
+          - $ref: '#/components/schemas/RidPolygon'
+          description: >-
+            Forma geográfica poligonal na superfície da Terra.
+        altitude_lower:
+          description: >-
+            Altitude mínima do volume. Se informada, deve ser menor que `altitude_upper`.
+          anyOf:
+          - $ref: '#/components/schemas/RidAltitude'
+        altitude_upper:
+          description: >-
+            Altitude máxima do volume. Se informada, deve ser maior que `altitude_lower`.
+          anyOf:
+          - $ref: '#/components/schemas/RidAltitude'
+    RidVolume4D:
+      description: Bloco contínuo de espaço-tempo geográfico.
+      required:
+      - volume
+      type: object
+      properties:
+        volume:
+          $ref: '#/components/schemas/RidVolume3D'
+        time_start:
+          description: Início do volume. Deve ser anterior a `time_end`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: Fim do volume. Deve ser posterior a `time_start`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+    RidGetSubscriptionResponse:
+      description: Resposta do DSS a uma requisição da subscription com o ID informado.
+      required:
+      - subscription
+      type: object
+      properties:
+        subscription:
+          $ref: '#/components/schemas/RidSubscription'
+    SearchSubscriptionsResponse:
+      description: Resposta do DSS a uma consulta de subscriptions em uma área.
+      type: object
+      properties:
+        subscriptions:
+          description: Subscriptions que se sobrepõem à área informada.
+          type: array
+          items:
+            $ref: '#/components/schemas/RidSubscription'
+          default: []
+    URL:
+      description: URL http ou https válida.
+      type: string
+      example: https://uss.empresa-b.com.br/rid
+    RidSubscriptionNotificationIndex:
+      format: int32
+      description: Contador das notificações enviadas para uma subscription, para que o subscriber perceba com mais facilidade notificações perdidas.
+      type: integer
+      example: 3
+    RidSubscriptionState:
+      description: Estado da subscription que motivou o envio de uma notificação.
+      required:
+      - subscription_id
+      type: object
+      properties:
+        subscription_id:
+          $ref: '#/components/schemas/SubscriptionUUID'
+        notification_index:
+          anyOf:
+          - $ref: '#/components/schemas/RidSubscriptionNotificationIndex'
+          default: 0
+    UUIDv4:
+      description: UUID versão 4.
+      maxLength: 36
+      minLength: 36
+      type: string
+      example: 03e5572a-f733-49af-bc14-8a18bd53ee39
+    Version:
+      description: 'A `version` é um texto opaco gerado pelo DSS, que muda a cada gravação (hoje, o instante da gravação em nanossegundos, escrito em base 32, ex.: `1hp9apg58umv8`). Envie exatamente o valor recebido, sem interpretá-lo. Toda atualização ou remoção deve informar a versão atual, para que as alterações sejam idempotentes.'
+      type: string
+      example: 1hp9apg58umv8
+    EntityUUID:
+      anyOf:
+      - $ref: '#/components/schemas/UUIDv4'
+      description: Identificador universalmente único de uma entidade comunicada pelo DSS, no formato UUIDv4.
+    SubscriptionUUID:
+      anyOf:
+      - $ref: '#/components/schemas/UUIDv4'
+      description: Identificador universalmente único de uma subscription comunicada pelo DSS, no formato UUIDv4.
+    RidErrorResponse:
+      description: Dados devolvidos quando ocorre uma condição fora do normal.
+      type: object
+      properties:
+        message:
+          description: Mensagem legível que indica o erro e/ou o motivo.
+          type: string
+          default: ''
+          example: IdentificationServiceArea time_end must be after time_start
+    RidDeleteSubscriptionResponse:
+      description: Resposta a uma remoção de subscription bem-sucedida.
+      required:
+      - subscription
+      type: object
+      properties:
+        subscription:
+          anyOf:
+          - $ref: '#/components/schemas/RidSubscription'
+          description: A subscription removida.
+    GeoPolygonString:
+      description: |
+        Representação em texto simples de um polígono geográfico com pelo menos três pontos, que descrevem um polígono fechado sobre a Terra. Cada ponto é latitude,longitude em graus, e os pontos também são separados por vírgula, então o parâmetro tem a forma `lat1,lng1,lat2,lng2,lat3,lng3,...`. Latitudes devem estar no intervalo [-90, 90] e longitudes no intervalo [-180, 180].
+
+        Não repita o primeiro ponto no fim: o DSS fecha o polígono sozinho e rejeita (`400`) uma área cujo último ponto repete o primeiro.
+
+        Todos os requisitos e esclarecimentos de Polygon valem também para GeoPolygonString.
+      type: string
+      example: -23.55,-46.64,-23.55,-46.63,-23.54,-46.63,-23.54,-46.64
+    RidLatitude:
+      format: double
+      description: Graus de latitude ao norte do equador, em relação ao elipsoide WGS84. Inválido, sem valor ou desconhecido é 0 grau (em latitude e longitude).
+      maximum: 90
+      exclusiveMaximum: false
+      minimum: -90
+      exclusiveMinimum: false
+      type: number
+      example: -23.5505
+      default: 0
+    RidLongitude:
+      format: double
+      description: Graus de longitude a leste do meridiano de Greenwich, em relação ao elipsoide WGS84. Inválido, sem valor ou desconhecido é 0 grau (em latitude e longitude).
+      maximum: 180
+      exclusiveMaximum: false
+      minimum: -180
+      exclusiveMinimum: false
+      type: number
+      example: -46.6333
+      default: 0
+    RidLatLngPoint:
+      description: Ponto na superfície da Terra.
+      required:
+      - lat
+      - lng
+      type: object
+      properties:
+        lng:
+          $ref: '#/components/schemas/RidLongitude'
+        lat:
+          $ref: '#/components/schemas/RidLatitude'
+    RidAltitude:
+      type: object
+      required:
+      - value
+      - reference
+      - units
+      properties:
+        value:
+          description: >-
+            Valor numérico da altitude. Os valores mínimo e máximo servem como verificação de sanidade e podem ser revistos à medida que novas unidades ou referenciais forem permitidos. Inválido, sem valor ou desconhecido é –1000 m.
+          type: number
+          format: double
+          minimum: -8000
+          exclusiveMinimum: false
+          maximum: 100000
+          exclusiveMaximum: false
+          example: 120
+        reference:
+          description: >-
+            Código do referencial da distância vertical. Ver AIXM 5.1 e FIXM 4.2.0. Hoje o UTM só aceita WGS84, sem planos imediatos de aceitar outros. FIXM e AIXM aceitam 'SFC', equivalente a AGL.
+          type: string
+          enum:
+          - W84
+        units:
+          description: >-
+            Unidade usada para expressar a altitude. Ver FIXM 4.2. Hoje o UTM só aceita metros, sem planos imediatos de aceitar outras.
+          type: string
+          enum:
+          - M
+    RidPolygon:
+      description: >-
+        Área fechada sobre a Terra. As arestas do polígono são os caminhos mais curtos entre vértices consecutivos. Isso significa, por exemplo, que a aresta entre dois pontos de mesma latitude em geral não fica sobre essa latitude. A ordem dos vértices deve ser interpretada como a que produz a menor área. As arestas não podem se cruzar e os vértices não podem se repetir; em particular, o último vértice não pode ser igual ao primeiro.
+      required:
+      - vertices
+      type: object
+      properties:
+        vertices:
+          minItems: 3
+          type: array
+          items:
+            $ref: '#/components/schemas/RidLatLngPoint'
+    PutIdentificationServiceAreaResponse:
+      description: Resposta a uma requisição de criação ou atualização da referência de uma Identification Service Area no DSS.
+      required:
+      - service_area
+      type: object
+      properties:
+        subscribers:
+          description: Subscribers do DSS que este cliente agora tem a obrigação de notificar sobre as mudanças que acabou de fazer na Identification Service Area. O cliente deve chamar POST em cada URL informada, conforme a API `/uss/identification_service_areas/{id}`.
+          type: array
+          items:
+            $ref: '#/components/schemas/RidSubscriberToNotify'
+          default: []
+        service_area:
+          anyOf:
+          - $ref: '#/components/schemas/IdentificationServiceArea'
+          description: Área de serviço resultante, gravada no DSS.
+    SearchIdentificationServiceAreasResponse:
+      description: Resposta do DSS a uma consulta de Identification Service Areas em uma área de interesse.
+      type: object
+      properties:
+        service_areas:
+          description: Identification Service Areas na área de interesse.
+          type: array
+          items:
+            $ref: '#/components/schemas/IdentificationServiceArea'
+          default: []
+    RidSubscriberToNotify:
+      description: Subscriber que deve ser notificado da criação, alteração ou remoção de algo no espaço aéreo. O DSS informa os subscribers ao cliente que alterou o espaço aéreo, e cabe a esse cliente (que recebe um conjunto destes pedidos) enviar uma notificação a cada `url` indicada.
+      required:
+      - subscriptions
+      - url
+      type: object
+      properties:
+        subscriptions:
+          description: Subscription(s) que motivaram esta notificação.
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/RidSubscriptionState'
+        url:
+          anyOf:
+          - $ref: '#/components/schemas/URL'
+          description: Endpoint a que o cliente que alterou o espaço aéreo deve enviar a atualização. A API depende da ação no DSS que gerou este pedido de notificação.
+    DeleteIdentificationServiceAreaResponse:
+      description: Resposta a uma requisição de remoção de Identification Service Area.
+      required:
+      - service_area
+      type: object
+      properties:
+        service_area:
+          anyOf:
+          - $ref: '#/components/schemas/IdentificationServiceArea'
+          description: Identification Service Area que acabou de ser removida.
+        subscribers:
+          description: Subscribers do DSS que este cliente agora tem a obrigação de notificar sobre a Identification Service Area que acabou de remover. O cliente deve chamar POST em cada URL informada, conforme a API `/uss/identification_service_areas`.
+          type: array
+          items:
+            $ref: '#/components/schemas/RidSubscriberToNotify'
+          default: []
+    RidPutSubscriptionResponse:
+      description: Resposta a uma requisição de criação ou atualização de subscription.
+      required:
+      - subscription
+      type: object
+      properties:
+        service_areas:
+          description: Identification Service Areas dentro ou perto da área da subscription no momento da criação ou atualização, se o callback `identification_service_area_url` tiver sido informado.
+          type: array
+          items:
+            $ref: '#/components/schemas/IdentificationServiceArea'
+          default: []
+        subscription:
+          anyOf:
+          - $ref: '#/components/schemas/RidSubscription'
+          description: Resultado da operação na subscription.
+    GetIdentificationServiceAreaResponse:
+      description: Resposta do DSS a uma requisição da Identification Service Area com o ID informado.
+      required:
+      - service_area
+      type: object
+      properties:
+        service_area:
+          $ref: '#/components/schemas/IdentificationServiceArea'
+    CreateIdentificationServiceAreaParameters:
+      description: Parâmetros de uma requisição para criar uma Identification Service Area no DSS.
+      required:
+      - extents
+      - uss_base_url
+      type: object
+      properties:
+        extents:
+          anyOf:
+          - $ref: '#/components/schemas/RidVolume4D'
+          description: |
+            Volumes espaço-temporais que delimitam esta Identification Service Area. O fim é obrigatório. Se o início não for informado, vale o momento atual. O DSS deve rejeitar inícios no passado, mas pode ajustar inícios muito recentes para o momento atual.
+
+            Estes volumes não devem revelar informações sensíveis sobre os voos que contêm. Isso significa, por exemplo, que não devem envolver justo a trajetória de um voo nem, em geral, ficar centrados no ponto de decolagem de um único voo.
+        uss_base_url:
+          $ref: '#/components/schemas/FlightsUSSBaseURL'
+    UpdateIdentificationServiceAreaParameters:
+      description: Parâmetros de uma requisição para atualizar uma Identification Service Area no DSS.
+      required:
+      - extents
+      - uss_base_url
+      type: object
+      properties:
+        extents:
+          anyOf:
+          - $ref: '#/components/schemas/RidVolume4D'
+          description: |
+            Volumes espaço-temporais que delimitam esta Identification Service Area. O fim é obrigatório. Se o início não for informado, ele não muda. O DSS deve rejeitar inícios no passado, a menos que sejam iguais ao início atual da Identification Service Area.
+
+            Estes volumes não devem revelar informações sensíveis sobre os voos que contêm. Isso significa, por exemplo, que não devem envolver justo a trajetória de um voo nem, em geral, ficar centrados no ponto de decolagem de um único voo.
+        uss_base_url:
+          $ref: '#/components/schemas/FlightsUSSBaseURL'
+    CreateSubscriptionParameters:
+      description: Parâmetros de uma requisição para criar uma subscription no DSS.
+      required:
+      - extents
+      - uss_base_url
+      type: object
+      properties:
+        extents:
+          anyOf:
+          - $ref: '#/components/schemas/RidVolume4D'
+          description: |
+            Volumes espaço-temporais da área de interesse.
+
+            A subscription é removida automaticamente depois do seu fim, se não for renovada antes. Se o fim não for informado, o DSS escolhe o valor.
+
+            Algumas entidades que geram notificações podem estar inteiramente fora da área pedida.
+        uss_base_url:
+          $ref: '#/components/schemas/SubscriptionUSSBaseURL'
+    UpdateSubscriptionParameters:
+      description: Parâmetros de uma requisição para atualizar uma subscription no DSS.
+      required:
+      - extents
+      - uss_base_url
+      type: object
+      properties:
+        extents:
+          anyOf:
+          - $ref: '#/components/schemas/RidVolume4D'
+          description: |
+            Volumes espaço-temporais da área de interesse.
+
+            A subscription é removida automaticamente depois do seu fim, se não for renovada antes. Se o fim não for informado, o DSS escolhe o valor.
+
+            Algumas entidades que geram notificações podem estar inteiramente fora da área pedida.
+        uss_base_url:
+          $ref: '#/components/schemas/SubscriptionUSSBaseURL'
+    RidSubscription:
+      description: Área geográfica pela qual um cliente tem interesse contínuo (por exemplo, uma "área de planejamento"). Interna ao DSS.
+      required:
+      - id
+      - uss_base_url
+      - owner
+      - version
+      type: object
+      properties:
+        id:
+          anyOf:
+          - $ref: '#/components/schemas/SubscriptionUUID'
+          description: Identificador único desta subscription.
+        uss_base_url:
+          $ref: '#/components/schemas/SubscriptionUSSBaseURL'
+        owner:
+          description: Atribuído pelo DSS com o ID do cliente que a criou (via token de acesso). Usado para restringir alterações e remoções ao `owner`.
+          type: string
+          example: empresa-a
+        notification_index:
+          anyOf:
+          - $ref: '#/components/schemas/RidSubscriptionNotificationIndex'
+          default: 0
+        time_end:
+          description: Se informado, a subscription é removida automaticamente depois deste instante.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_start:
+          description: Se informado, a subscription não gera notificações antes deste instante.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        version:
+          $ref: '#/components/schemas/Version'
+    IdentificationServiceArea:
+      description: 'Uma Identification Service Area (área em que um SW-USS presta serviço de Remote ID). O DSS guarda e devolve apenas esta referência: `id`, `owner`, `uss_base_url`, intervalo de tempo e `version`. A área não é devolvida, e os clientes trocam as informações dos voos diretamente entre si (peer-to-peer).'
+      required:
+      - uss_base_url
+      - owner
+      - time_start
+      - time_end
+      - version
+      - id
+      type: object
+      properties:
+        uss_base_url:
+          $ref: '#/components/schemas/FlightsUSSBaseURL'
+        owner:
+          description: Atribuído pelo DSS com o ID do cliente que a criou (via token de acesso). Usado para restringir alterações e remoções ao `owner`.
+          type: string
+          example: empresa-a
+        time_start:
+          description: Início do serviço.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: Fim do serviço.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        version:
+          $ref: '#/components/schemas/Version'
+        id:
+          anyOf:
+          - $ref: '#/components/schemas/EntityUUID'
+          description: Identificador único desta Identification Service Area.
+    USSBaseURL:
+      description: |-
+        URL base da implementação, no SW-USS, de parte ou de toda a API de Remote ID entre SW-USS. A URL completa de um recurso é montada acrescentando, por exemplo, `/uss/{resource}/{id}` a esta URL base. Por isso, ela não pode terminar com '/'. O host é um domínio, não um endereço IP, porque o `intended_audience` dos tokens para este SW-USS é esse domínio, sem a porta.
+      type: string
+      example: https://uss.empresa-a.com.br/rid
+    SubscriptionUSSBaseURL:
+      description: URL base da implementação da API de SW-USS, incluindo o endpoint `POST identification_service_areas`, em que as notificações desta subscription serão recebidas.
+      anyOf:
+      - $ref: '#/components/schemas/USSBaseURL'
+    FlightsUSSBaseURL:
+      description: URL base da implementação da API de SW-USS, incluindo os endpoints `GET flights` e `GET flights/{id}/details`, em que as informações de voo podem ser obtidas.
+      anyOf:
+      - $ref: '#/components/schemas/USSBaseURL'

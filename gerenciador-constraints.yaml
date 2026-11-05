@@ -1,0 +1,742 @@
+openapi: 3.0.2
+info:
+  title: SW-USS Gerenciador de Constraints
+  version: 1.0.0
+  description: |
+    Como obter os detalhes de uma constraint encontrada no DSS. Toda constraint reference do DSS aponta, em `uss_base_url`, para o SW-USS Gerenciador de Constraints que a gerencia, e é nele que o seu SW-USS busca os detalhes, sempre do mesmo jeito. O seu SW-USS **chama** este endpoint; não o implementa.
+
+    ## O SW-USS Gerenciador de Constraints
+
+    É um SW-USS comum da ASTM F3548-21, com uma única responsabilidade: criar e guardar constraints e fornecer os detalhes delas. Na Fase 1, só o DECEA cria constraints, e o DECEA tem vários Gerenciadores de Constraints, que geram constraints de formas diferentes. Para o seu SW-USS, não importa qual deles gerencia uma constraint: todos se comportam como descrito aqui, no endereço indicado na constraint reference.
+
+    ## O que é uma constraint
+
+    Uma restrição do espaço aéreo, válida em uma área e em um intervalo de tempo. No BR-UTM, é qualquer coisa que o DECEA considere que não deve ser intersectada pelo tráfego de UAS. Entre outras, as constraints vêm de:
+
+    - reservas de espaço aéreo do DASA, uma ferramenta do DECEA (por exemplo, por causa de aeródromos ou de outros usos do espaço aéreo, como paraquedismo);
+    - tráfego tripulado (aviões e helicópteros) dentro de uma Zona UTM, tratado automaticamente pelo DECEA.
+
+    Para os SW-USS, todas aparecem como constraint references comuns no DSS.
+
+    ## Como funciona
+
+    1. O Gerenciador de Constraints cria a constraint reference no DSS, com volumes envolventes e o seu `uss_base_url`, e guarda os detalhes.
+    2. Ele notifica os SW-USS que têm subscriptions na área com `notify_for_constraints: true` (`POST /uss/v1/constraints`, em `sw-uss.yaml`), enviando os detalhes.
+    3. Quem consulta o DSS (`POST /dss/v1/constraint_references/query`) recebe só as referências, e busca os detalhes neste endpoint, no `uss_base_url` de cada referência.
+
+    ## Como o seu SW-USS usa
+
+    1. **Peça notificações de constraints.** Ao criar a operational intent, envie `new_subscription` com `notify_for_constraints: true` (ou use uma subscription sua com `notify_for_constraints: true`). Isso exige o escopo `utm.constraint_processing` no token, junto com `utm.strategic_coordination`. Assim, o seu SW-USS recebe `POST /uss/v1/constraints` quando uma constraint da área muda, e o DSS passa a exigir na `key` os OVNs das constraints da área (ver `dss.yaml`).
+    2. **Busque os detalhes de cada constraint encontrada no DSS**, neste endpoint, ao planejar uma operação e antes de ativá-la.
+    3. **Verifique sempre se a operational intent intersecta alguma constraint**, com os volumes exatos. Uma operational intent que intersecta uma constraint não pode ser ativada.
+    4. **Inclua o OVN de cada constraint** (`constraint.reference.ovn`) na `key` ao criar ou alterar operational intents.
+    5. **Use os detalhes recebidos nas notificações** para adaptar as suas operações afetadas: uma operação que a constraint intersecta é alterada para eliminar a interseção ou encerrada, em até cinco minutos depois do recebimento da notificação se estiver `Activated`, mesmo que a constraint só comece depois; nesse prazo, o drone também sai da interseção ou pousa. Não é obrigatório guardá-los: os detalhes e o OVN atual podem ser obtidos de novo neste endpoint.
+
+    ## URL base
+
+    O caminho deste arquivo é acrescentado ao `uss_base_url` da constraint reference devolvida pelo DSS, que pode mudar de uma constraint para outra. Ex.: com `https://gerenciador-a.exemplo.br/utm`, os detalhes ficam em `https://gerenciador-a.exemplo.br/utm/uss/v1/constraints/{entityid}`.
+
+    ## Autenticação
+
+    Chame com `Authorization: Bearer <token>`, um token obtido em `GET /token` (ver `token.yaml`) com:
+
+    - `scope`: `utm.constraint_processing`;
+    - `intended_audience`: o domínio do `uss_base_url` da constraint (só o domínio, sem esquema, porta ou caminho).
+servers:
+- url: '{uss_base_url}'
+  description: O `uss_base_url` da constraint reference devolvida pelo DSS
+  variables:
+    uss_base_url:
+      default: https://gerenciador-a.exemplo.br/utm
+      description: URL base, sem `/` no fim
+security:
+- Authority:
+  - utm.constraint_processing
+tags:
+- name: Constraint details
+  description: >-
+    Endpoint do SW-USS Gerenciador de Constraints que fornece os detalhes de uma constraint.
+paths:
+  /uss/v1/constraints/{entityid}:
+    summary: Consulta os detalhes de uma constraint em um SW-USS Gerenciador de Constraints.
+    parameters:
+    - name: entityid
+      description: EntityID da constraint, o mesmo `id` da constraint reference no DSS.
+      schema:
+        $ref: '#/components/schemas/EntityID'
+      in: path
+      required: true
+      example: c3a1e7d2-5f4b-4a8e-b9d0-6e2f1a3c7b54
+    get:
+      tags:
+      - Constraint details
+      security:
+      - Authority:
+        - utm.constraint_processing
+      summary: Obtém os detalhes de uma constraint
+      operationId: getConstraintDetails
+      description: |
+        **Escopo exigido no token de quem chama:** `utm.constraint_processing`
+
+        **Quem chama:** os SW-USS que encontraram a constraint reference no DSS.
+
+        Devolve os detalhes (e a referência) de uma constraint gerenciada por este SW-USS Gerenciador de Constraints: os volumes exatos, o tipo e, se for o caso, os dados de geo zone (ED-269). O seu SW-USS chama este endpoint no `uss_base_url` da constraint reference encontrada no DSS.
+
+        - Use os volumes para verificar a interseção com as suas operational intents: uma operational intent que intersecta uma constraint não pode ser ativada.
+        - O OVN da constraint, em `constraint.reference.ovn`, vai na `key` ao criar ou alterar operational intents.
+        - O Gerenciador de Constraints devolve a última versão que o DSS aceitou. Enquanto uma alteração no DSS estiver pendente, ele continua devolvendo a versão anterior; antes de o DSS confirmar a criação, responde `404`.
+        - `details.type` ainda não tem valores definidos no BR-UTM, e `details.geozone` ainda não é usado pelo DECEA: na maioria das vezes, deve vir vazio.
+
+        No BR-UTM, buscar os detalhes das constraints encontradas no DSS é obrigatório para todo SW-USS que opera voos.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetConstraintDetailsResponse'
+              examples:
+                constraint:
+                  summary: Constraint do DECEA no centro de São Paulo
+                  value:
+                    constraint:
+                      reference:
+                        id: c3a1e7d2-5f4b-4a8e-b9d0-6e2f1a3c7b54
+                        manager: decea
+                        uss_availability: Normal
+                        version: 1
+                        ovn: xrjOayrr64dKAR6MZR2rVUOpqC8FsDntbACrOOMCgjw_
+                        time_start:
+                          value: '2026-11-05T00:00:00Z'
+                          format: RFC3339
+                        time_end:
+                          value: '2026-11-06T00:00:00Z'
+                          format: RFC3339
+                        uss_base_url: https://gerenciador-a.exemplo.br/utm
+                      details:
+                        volumes:
+                        - volume:
+                            outline_polygon:
+                              vertices:
+                              - lat: -23.55
+                                lng: -46.64
+                              - lat: -23.55
+                                lng: -46.63
+                              - lat: -23.54
+                                lng: -46.63
+                              - lat: -23.54
+                                lng: -46.64
+                            altitude_lower:
+                              value: 0
+                              reference: W84
+                              units: M
+                            altitude_upper:
+                              value: 120
+                              reference: W84
+                              units: M
+                          time_start:
+                            value: '2026-11-05T00:00:00Z'
+                            format: RFC3339
+                          time_end:
+                            value: '2026-11-06T00:00:00Z'
+                            format: RFC3339
+          description: Os detalhes da constraint foram obtidos com sucesso.
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                idInvalido:
+                  summary: EntityID fora do formato UUIDv4
+                  value:
+                    message: entityid must be a UUIDv4
+          description: Um ou mais parâmetros de entrada estão ausentes ou inválidos.
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso Bearer não foi enviado no header `Authorization`, não pôde ser decodificado ou é inválido.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O token de acesso foi decodificado, mas não contém um escopo adequado a este endpoint.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                naoEncontrada:
+                  summary: Constraint inexistente ou ainda não confirmada pelo DSS
+                  value:
+                    message: Constraint c3a1e7d2-5f4b-4a8e-b9d0-6e2f1a3c7b54 not found
+          description: >-
+            A constraint não foi encontrada neste Gerenciador de Constraints, ou a sua criação ainda não foi confirmada pelo DSS.
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+          description: >-
+            O cliente fez requisições demais em pouco tempo.
+components:
+  securitySchemes:
+    Authority:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: /token
+          scopes:
+            utm.constraint_processing: >-
+              O cliente pode ler referências de constraints no DSS e os detalhes nos SW-USS parceiros, conforme o papel Constraint Processing.
+      description: |
+        Token de acesso JWT emitido pelo Auth Server do BR-UTM em `GET /token` (ver `token.yaml`). O tipo `oauth2` é usado aqui só para declarar o escopo da operação: o BR-UTM não usa o fluxo OAuth *client credentials*.
+
+        Envie o token no header `Authorization: Bearer <token>`, com `aud` igual ao domínio do Gerenciador de Constraints e o escopo `utm.constraint_processing`.
+  schemas:
+    UUIDv4Format:
+      description: >-
+        Texto no formato de um UUID versão 4, conforme a RFC 4122.
+      maxLength: 36
+      minLength: 36
+      type: string
+      format: uuid
+      pattern: >-
+        ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$
+      example: 03e5572a-f733-49af-bc14-8a18bd53ee39
+    EntityID:
+      description: >-
+        Identificador de uma entidade comunicada pelo DSS, no formato UUIDv4.
+      anyOf:
+      - $ref: '#/components/schemas/UUIDv4Format'
+      example: 2f8343be-6482-4d1b-a474-16847e01af1e
+    EntityOVN:
+      title: EntityOVN
+      description: >-
+        Token associado a uma versão específica de uma entidade UTM, criado pelo DSS quando a referência da entidade é criada ou alterada, e entregue ao cliente que fez a alteração. O DSS guarda o EntityOVN de forma privada e o compara com os itens da `key` enviada nas escritas no espaço aéreo. O cliente também informa o EntityOVN sempre que transmite as informações completas da entidade (em um GET ou em uma notificação de subscription).
+      type: string
+      minLength: 16
+      maxLength: 128
+      example: 9d158f59-80b7-4c11-9c0c-8a2b4d936b2d
+    EntityVersion:
+      title: EntityVersion
+      description: >-
+        Versão numérica da entidade, incrementada a cada alteração, mesmo que nenhum campo mude. Um SW-USS que já tem os detalhes de uma versão não precisa buscá-los de novo até a versão mudar.
+      type: integer
+      format: int32
+      example: 1
+    Time:
+      required:
+      - value
+      - format
+      type: object
+      properties:
+        value:
+          type: string
+          description: >-
+            Data e hora no formato RFC 3339. O fuso horário deve ser 'Z'.
+          format: date-time
+          example: '1985-04-12T23:20:50.52Z'
+        format:
+          type: string
+          enum:
+          - RFC3339
+    Radius:
+      required:
+      - value
+      - units
+      type: object
+      properties:
+        value:
+          format: float
+          description: >-
+            Distância a partir do centro de uma área circular, sobre o elipsoide WGS84.
+          type: number
+          minimum: 0
+          exclusiveMinimum: true
+          example: 300.183
+        units:
+          type: string
+          description: >-
+            Unidades compatíveis com FIXM. No UTM, só metros ("M") são aceitos.
+          enum:
+          - M
+    Altitude:
+      type: object
+      required:
+      - value
+      - reference
+      - units
+      properties:
+        value:
+          description: >-
+            Valor numérico da altitude. Os valores mínimo e máximo servem como verificação de sanidade e podem ser revistos à medida que novas unidades ou referenciais forem permitidos.
+          type: number
+          format: double
+          minimum: -8000
+          exclusiveMinimum: false
+          maximum: 100000
+          exclusiveMaximum: false
+        reference:
+          description: >-
+            Código do referencial da distância vertical. Ver AIXM 5.1 e FIXM 4.2.0. Hoje o UTM só aceita WGS84, sem planos imediatos de aceitar outros. FIXM e AIXM aceitam 'SFC', equivalente a AGL.
+          type: string
+          enum:
+          - W84
+        units:
+          description: >-
+            Unidade usada para expressar a altitude. Ver FIXM 4.2. Hoje o UTM só aceita metros, sem planos imediatos de aceitar outras.
+          type: string
+          enum:
+          - M
+    Latitude:
+      description: >-
+        Graus de latitude ao norte do equador, em relação ao elipsoide WGS84.
+      maximum: 90
+      exclusiveMaximum: false
+      minimum: -90
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: 34.123
+    Longitude:
+      description: >-
+        Graus de longitude a leste do meridiano de Greenwich, em relação ao elipsoide WGS84.
+      minimum: -180
+      exclusiveMaximum: false
+      maximum: 180
+      exclusiveMinimum: false
+      type: number
+      format: double
+      example: -118.456
+    Polygon:
+      description: >-
+        Área fechada sobre a Terra. As arestas do polígono são os caminhos mais curtos entre vértices consecutivos. Isso significa, por exemplo, que a aresta entre dois pontos de mesma latitude em geral não fica sobre essa latitude. A ordem dos vértices deve ser interpretada como a que produz a menor área. As arestas não podem se cruzar e os vértices não podem se repetir; em particular, o último vértice não pode ser igual ao primeiro.
+      required:
+      - vertices
+      type: object
+      properties:
+        vertices:
+          minItems: 3
+          type: array
+          items:
+            $ref: '#/components/schemas/LatLngPoint'
+    LatLngPoint:
+      description: Ponto na superfície da Terra.
+      required:
+      - lat
+      - lng
+      type: object
+      properties:
+        lng:
+          $ref: '#/components/schemas/Longitude'
+        lat:
+          $ref: '#/components/schemas/Latitude'
+    Circle:
+      description: Área circular na superfície da Terra.
+      type: object
+      properties:
+        center:
+          $ref: '#/components/schemas/LatLngPoint'
+        radius:
+          $ref: '#/components/schemas/Radius'
+    Volume3D:
+      description: >-
+        Volume geográfico tridimensional formado pela extrusão vertical de uma forma. Deve ser informado exatamente um contorno.
+      type: object
+      properties:
+        outline_circle:
+          anyOf:
+          - $ref: '#/components/schemas/Circle'
+          description: Forma geográfica circular na superfície da Terra.
+        outline_polygon:
+          anyOf:
+          - $ref: '#/components/schemas/Polygon'
+          description: >-
+            Forma geográfica poligonal na superfície da Terra.
+        altitude_lower:
+          description: >-
+            Altitude mínima do volume. Se informada, deve ser menor que `altitude_upper`.
+          anyOf:
+          - $ref: '#/components/schemas/Altitude'
+        altitude_upper:
+          description: >-
+            Altitude máxima do volume. Se informada, deve ser maior que `altitude_lower`.
+          anyOf:
+          - $ref: '#/components/schemas/Altitude'
+    Volume4D:
+      description: Bloco contínuo de espaço-tempo geográfico.
+      required:
+      - volume
+      type: object
+      properties:
+        volume:
+          $ref: '#/components/schemas/Volume3D'
+        time_start:
+          description: Início do volume. Deve ser anterior a `time_end`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+        time_end:
+          description: Fim do volume. Deve ser posterior a `time_start`.
+          anyOf:
+          - $ref: '#/components/schemas/Time'
+    ErrorResponse:
+      description: >-
+        Texto legível devolvido quando uma requisição ao Gerenciador de Constraints resulta em erro.
+      type: object
+      properties:
+        message:
+          description: >-
+            Mensagem legível que indica o erro e/ou o motivo.
+          type: string
+          example: Constraint c3a1e7d2-5f4b-4a8e-b9d0-6e2f1a3c7b54 not found
+    UssBaseURL:
+      description: >-
+        URL base da implementação, no SW-USS, de parte ou de toda a API entre SW-USS. A URL completa de um recurso é montada acrescentando, por exemplo, `/uss/v1/{resource}/{id}` a esta URL base. Por isso, ela não pode terminar com '/'. O host é um domínio, não um endereço IP, porque o `intended_audience` dos tokens para este SW-USS é esse domínio, sem a porta.
+      type: string
+      example: https://uss.example.com/utm
+    ConstraintReference:
+      description: >-
+        Uma ConstraintReference (área em que existe uma constraint, com outras informações gerais, mas sem os detalhes). O DSS informa apenas estas referências; os clientes trocam os detalhes e as informações adicionais diretamente entre si (peer-to-peer).
+      required:
+      - id
+      - manager
+      - uss_availability
+      - version
+      - time_start
+      - time_end
+      - uss_base_url
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/EntityID'
+        manager:
+          type: string
+          example: uss1
+          description: >-
+            Preenchido pelo DSS com o ID do cliente que criou a entidade (o `sub` do token de acesso). Usado pelo DSS para restringir alterações e remoções ao `manager`, e pelos SW-USS para rejeitar notificações de constraint enviadas por um SW-USS que não a gerencia.
+        uss_availability:
+          $ref: '#/components/schemas/UssAvailabilityState'
+        version:
+          $ref: '#/components/schemas/EntityVersion'
+        ovn:
+          description: >-
+            OVN desta constraint. Só é preenchido quando a ConstraintReference é gerenciada pelo SW-USS que a consulta ou a fornece. Caso contrário, o SW-USS deve obter o OVN nos detalhes fornecidos pelo SW-USS que a gerencia.
+          anyOf:
+          - $ref: '#/components/schemas/EntityOVN'
+        time_start:
+          $ref: '#/components/schemas/Time'
+        time_end:
+          $ref: '#/components/schemas/Time'
+        uss_base_url:
+          $ref: '#/components/schemas/ConstraintUssBaseURL'
+    ConstraintUssBaseURL:
+      description: >-
+        URL base da implementação, no SW-USS, das partes da API entre SW-USS necessárias para fornecer os detalhes desta constraint.
+      anyOf:
+      - $ref: '#/components/schemas/UssBaseURL'
+    ConstraintDetails:
+      description: >-
+        Detalhes de uma constraint. Estes dados não ficam no DSS, só nos SW-USS.
+      required:
+      - volumes
+      type: object
+      properties:
+        volumes:
+          description: |
+            Volumes que contêm toda a constraint, tão pequenos quanto possível.
+            O fim não pode estar no passado.
+          minItems: 1
+          type: array
+          items:
+            $ref: '#/components/schemas/Volume4D'
+        type:
+          description: >-
+            Tipo de restrição do espaço aéreo que esta constraint representa. No BR-UTM, os valores deste campo ainda não foram definidos.
+          type: string
+        geozone:
+          description: >-
+            Se esta constraint for uma geo zone conforme a ED-269, os detalhes dessa geo zone. No BR-UTM, o DECEA ainda não usa este campo: na maioria das vezes, ele vem vazio. O campo é mantido para uso futuro.
+          anyOf:
+          - $ref: '#/components/schemas/GeoZone'
+    Constraint:
+      description: Especificação completa de uma constraint.
+      required:
+      - reference
+      - details
+      type: object
+      properties:
+        reference:
+          $ref: '#/components/schemas/ConstraintReference'
+        details:
+          $ref: '#/components/schemas/ConstraintDetails'
+    GetConstraintDetailsResponse:
+      description: >-
+        Resposta a um pedido dos detalhes da constraint com o ID informado.
+      required:
+      - constraint
+      type: object
+      properties:
+        constraint:
+          $ref: '#/components/schemas/Constraint'
+    UssAvailabilityState:
+      type: string
+      enum:
+      - Unknown
+      - Normal
+      - Down
+      description: |
+        Um SW-USS é considerado `Unknown` até que um SW-USS com o escopo de arbitragem de disponibilidade indique outra coisa. Quando a arbitragem determina que um SW-USS não responde adequadamente, ele passa a `Down`.
+        Um SW-USS em `Unknown` tem, no DSS, as mesmas capacidades de um SW-USS em `Normal`. No DSS do BR-UTM, um SW-USS `Down` também mantém essas capacidades: continua podendo criar, alterar e remover as próprias operational intents. O efeito de `Down` está descrito em `PUT /dss/v1/uss_availability/{uss_id}` (ver `dss.yaml`).
+    GeoZone:
+      type: object
+      description: >-
+        Espaço aéreo de dimensões definidas, sobre o território terrestre ou as águas territoriais de um Estado, em que se aplica uma restrição ou condição específica para voos de UAS (modelo de dados da ED-269). Ainda não é usado pelo DECEA (ver `ConstraintDetails.geozone`).
+      required:
+      - identifier
+      - country
+      - type
+      - restriction
+      - zone_authority
+      properties:
+        identifier:
+          anyOf:
+          - $ref: '#/components/schemas/CodeZoneIdentifierType'
+          description: |
+            Texto que identifica de forma única a zona de UAS dentro do Estado ou território indicado em `country`.
+            Observação: a zona de UAS é identificada de forma única no mundo pela combinação de `country` e `identifier`.
+        country:
+          anyOf:
+          - $ref: '#/components/schemas/CodeCountryISOType'
+          description: |
+            Estado que tem autoridade para declarar a zona.
+            Observação: nenhuma zona pertence a dois Estados. Não é preciso codificar que duas zonas estão "em Estados vizinhos" ou são "relacionadas".
+        zone_authority:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Authority'
+        name:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: >-
+            Nome livre pelo qual a zona é conhecida pelo público ou pela comunidade de UAS.
+        type:
+          anyOf:
+          - $ref: '#/components/schemas/CodeZoneType'
+          description: >-
+            Indica se a zona é fornecida com a definição comum ou com uma definição personalizada para um usuário específico.
+        restriction:
+          anyOf:
+          - $ref: '#/components/schemas/CodeRestrictionType'
+          description: >-
+            Indica se voar na zona é condicionado, proibido ou livre.
+        restriction_conditions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConditionExpressionType'
+          description: >-
+            Indica as condições em que a zona pode ser usada.
+        region:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 65535
+          description: |
+            Quando aplicável, identifica a região, dentro de um Estado, em que a zona de UAS fica.
+            Observação 1) identificada por um número entre 0 e 65535 (16 bits), correspondente a uma lista de regiões predefinida para cada Estado.
+            Observação 2) este atributo serve para facilitar a extração de subconjuntos de dados de regiões específicas.
+        reason:
+          items:
+            $ref: '#/components/schemas/CodeZoneReasonType'
+          description: >-
+            Indicação codificada do motivo que levou à criação da zona.
+          maxItems: 9
+          type: array
+        other_reason_info:
+          type: string
+          maxLength: 30
+          description: >-
+            Descrição livre do motivo que levou à criação da zona, quando não coberto por um valor codificado.
+        regulation_exemption:
+          anyOf:
+          - $ref: '#/components/schemas/CodeYesNoType'
+          description: >-
+            Indica se a zona de UAS admite isenções da regulamentação (`YES`) ou não (`NO`). As isenções são detalhadas no campo `message`.
+        u_space_class:
+          anyOf:
+          - $ref: '#/components/schemas/CodeUSpaceClassType'
+          description: |
+            Código que identifica a categoria ou classe da zona segundo um "conceito U-space".
+            Observação: existem duas classificações (em rascunho), uma da Eurocontrol e outra do CORUS. Por isso, esperam-se duas instâncias deste atributo, uma de cada lista. Isso pode ser substituído no futuro por atributos e listas de valores separados.
+        message:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: >-
+            Mensagem a exibir ao usuário da zona, em geral na estação do piloto remoto, para informá-lo de algo específico da zona (em geral, quando não se trata só de uma restrição de voo, e portanto não só de um alerta ou de uma limitação automática; por exemplo: "captura de imagens proibida nesta zona", "ventos fortes frequentes nesta zona", "proibido pousar ou decolar nesta zona"). A mensagem também indica isenções da regulamentação na zona (ver abaixo). Várias informações podem ser agrupadas, separadas por "/".
+        additional_properties:
+          type: object
+          description: >-
+            Ponto de extensão: permite acrescentar atributos de interesse nacional.
+    CodeZoneIdentifierType:
+      type: string
+      maxLength: 7
+      description: |
+        Texto de no máximo 7 caracteres que identifica a área de forma única em um escopo geográfico.
+        OBSERVAÇÃO (1): não inclui o identificador do país, que é um atributo separado da zona de UAS.
+        OBSERVAÇÃO (2): o limite de 7 caracteres garante compatibilidade com ARINC 424 e AIXM, em que um designador de espaço aéreo tem no máximo 10 caracteres: os 10 caracteres resultam da concatenação de `country` e `identifier`.
+    CodeCountryISOType:
+      type: string
+      minLength: 3
+      maxLength: 3
+      description: |
+        Identificador de 3 letras de um país ou território, conforme a ISO 3166-1 alpha-3.
+        OBSERVAÇÃO: os códigos de 3 letras da ISO têm estas vantagens:
+        - distinguem territórios remotos do território continental;
+        - são únicos, ao contrário dos códigos de país da ICAO, em que um mesmo Estado pode ter dois ou mais códigos;
+        - também são usados em normas militares, como a STANAG 1059 INT da OTAN, que traz acréscimos bem documentados que podem ser úteis para áreas de UAS.
+    CodeZoneType:
+      type: string
+      description: >-
+        Indica se a zona de UAS é fornecida com a definição comum (`COMMON`) ou com uma definição personalizada para um UAS ou operador específico (`CUSTOMIZED`).
+      enum:
+      - COMMON
+      - CUSTOMIZED
+    ConditionExpressionType:
+      type: string
+      maxLength: 10000
+      description: |
+        Expressão codificada que informa o que é autorizado ou proibido em uma zona de acesso condicionado. Ao contrário do campo `message` da zona, esta expressão é feita para ser interpretada pelo UAS, enquanto `message` é interpretado pelo piloto remoto.
+        OBSERVAÇÃO: o tamanho máximo do campo é de 10.000 caracteres.
+
+        **Linguagem de definição das condições**
+
+        - Cada Estado estabelece uma lista de características relevantes (CHARTYPE) e a lista finita de valores aceitos de cada uma (CHARVAL).
+        - Cada campo CHARTYPE e CHARVAL é definido por um conjunto limitado de caracteres.
+        - Um documento público dá a definição de cada um e a referência às características legais ou técnicas envolvidas.
+        - O editor de geozones de cada Estado usa essas características, com a linguagem de condições abaixo, para definir as condições exatas de cada zona.
+        - A função de geofencing de cada UAS recebe o estado das características do UAS para o voo pretendido, para aplicar as condições, seja gerando alertas, seja limitando o voo.
+        - Se o valor de uma característica da condição não estiver definido no UAS, a função de geofencing deve avisar o piloto (alerta de geoawareness) ou, no geofencing automático, considerar a zona proibida.
+
+        Uma expressão condicional tem esta forma:
+
+        - O UAS é PERMITIDO ou (exclusivo) PROIBIDO de voar nesta zona neste momento SE (Característica1) CHARTYPE1 = (Valor1) CHARVAL1 E CHARTYPE2 = CHARVAL2 E ... Fim SE OU (...) ... Fim OU
+        - Só os campos variáveis são editados na string, separados por "/"; os demais são implícitos.
+
+        Exemplos de CHARTYPE e CHARVAL:
+
+        - CHARTYPE: tipo de operador; CHARVAL aceitos: Militar/Polícia/Bombeiros
+        - CHARTYPE: ID do operador (número de registro); CHARVAL aceitos: conforme o formato de registro
+        - CHARTYPE: tipo de operação: A1 conforme as categorias Open da EASA, S1 (cenário padrão nacional 1), STS01 (cenário padrão da categoria Specific da EASA) etc.
+        - CHARTYPE: tipo de operação UTM: Planejada/Não planejada
+        - CHARTYPE: passageiros a bordo: sim/não
+
+        Cada catálogo nacional de CHARTYPE e CHARVAL pode definir categorias complexas de operação, drone ou equipamento. Exemplo: no país A, pode haver um tipo "nível do drone" com os valores Baixo, Médio e Alto, cada um correspondendo a um conjunto definido de desempenho do UAS, características da operação, qualificação do operador etc. Isso evita codificar uma combinação complexa no banco de geozones. A expressão também pode codificar a proibição de captura de imagens em uma zona.
+
+        Exemplo: `PERMITTED/IMAGE CAPTURE=NO/NOISE CLASS=A/OR/OPERATOR=POLICE`
+
+        Significado: o voo é permitido nesta zona neste momento se nenhuma imagem for capturada (câmera removida ou desativada) e se a classe de ruído for A (segundo uma classificação conhecida), ou se o operador do UAS for a Polícia.
+    CodeRestrictionType:
+      type: string
+      description: |
+        Indica se voar na zona é proibido, exige autorização, é condicionado ou é livre.
+
+        - `PROHIBITED`: voar na zona é proibido.
+        - `REQ_AUTHORISATION`: voar na zona exige autorização prévia (ver `zone_authority`).
+        - `CONDITIONAL`: voar na zona é permitido nas condições de `restriction_conditions`.
+        - `NO_RESTRICTION`: não há restrição para voar na zona.
+      enum:
+      - PROHIBITED
+      - REQ_AUTHORISATION
+      - CONDITIONAL
+      - NO_RESTRICTION
+    CodeZoneReasonType:
+      type: string
+      description: >-
+        Indicação codificada do motivo que justifica a existência de uma zona de UAS.
+      enum:
+      - AIR_TRAFFIC
+      - SENSITIVE
+      - PRIVACY
+      - POPULATION
+      - NATURE
+      - NOISE
+      - FOREIGN_TERRITORY
+      - EMERGENCY
+      - OTHER
+    CodeUSpaceClassType:
+      type: string
+      maxLength: 100
+      description: |
+        Identificador codificado da categoria ou classe da zona segundo um "conceito U-space".
+        OBSERVAÇÃO: nesta versão do modelo, não há lista específica de valores. Por exemplo, os tipos de zona "X", "Y" e "Z" do projeto CORUS (SESAR JU) sobre o conceito de operação U-space poderão ser usados em uma versão futura. Até que haja uma lista definida, este tipo é tratado como texto de no máximo 100 caracteres.
+    CodeYesNoType:
+      type: string
+      description: >-
+        Valor codificado que indica uma escolha entre aplicável (sim) e não aplicável (não).
+      enum:
+      - YES
+      - NO
+    Authority:
+      type: object
+      description: |
+        Autoridade responsável por autorizar, ser notificada ou fornecer informações sobre operações de UAS na zona.
+        Regra: pelo menos um destes campos deve ser informado: `site_url`, `email` ou `phone`.
+      properties:
+        name:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: Nome oficial de uma autoridade pública ou privada.
+        service:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: >-
+            Nome de um departamento ou serviço específico da organização.
+        contact_name:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: >-
+            Nome ou função de uma pessoa específica a ser contatada na organização.
+        site_url:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: |
+            URL do site público pelo qual a organização pode ser contatada.
+            Observação: no formato de codificação, isso pode ser restringido para garantir uma URL válida.
+        email:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: |
+            Endereço de e-mail pelo qual a organização pode ser contatada.
+            Observação: no formato de codificação, isso pode ser restringido para garantir um e-mail válido.
+        phone:
+          anyOf:
+          - $ref: '#/components/schemas/TextShortType'
+          description: >-
+            Telefone pelo qual a organização pode ser contatada.
+        purpose:
+          anyOf:
+          - $ref: '#/components/schemas/CodeAuthorityRole'
+          description: Papel da autoridade em relação à zona.
+        interval_before:
+          type: string
+          format: duration
+          description: >-
+            Intervalo mínimo entre a notificação ou o pedido de autorização e o início da operação na zona, no formato PnnDTnnHnnM (ISO 8601).
+    CodeAuthorityRole:
+      type: string
+      description: >-
+        Lista de valores codificados que indica o papel de uma autoridade em relação à zona de UAS.
+      enum:
+      - AUTHORIZATION
+      - NOTIFICATION
+      - INFORMATION
+    TextShortType:
+      type: string
+      maxLength: 200
+      description: Texto livre de no máximo 200 caracteres.
