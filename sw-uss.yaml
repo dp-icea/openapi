@@ -1,7 +1,7 @@
 openapi: 3.0.2
 info:
   title: SW-USS
-  version: 1.0.0
+  version: 1.0.1
   description: |
     Endpoints que todo SW-USS (Gerenciador de Operações) expõe aos demais participantes do BR-UTM. O seu SW-USS também chama estes mesmos endpoints nos outros SW-USS: o contrato é o mesmo nos dois sentidos.
 
