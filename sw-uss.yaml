@@ -48,10 +48,10 @@ info:
     2. **Planejamento e desconflitação.** Para cada pedido de voo:
        - Verifique se a posição do voo está estritamente dentro de uma Zona UTM a que o SW-USS tem acesso (Provedor de Zona UTM, ver `provedor-zona-utm.yaml`).
        - Consulte no DSS as operational intents e as constraints da área, e busque os detalhes nos SW-USS que as gerenciam e no Gerenciador de Constraints.
-       - Verifique os conflitos com os volumes exatos. Nenhuma operational intent pode intersectar outra, seja o voo VLOS ou BVLOS, e volumes que só se encostam não conflitam. Em Zona UTM do tipo U1, use prioridade `1`.
+       - Verifique os conflitos com os volumes exatos. Uma operational intent pode ser criada (`Accepted`) mesmo intersectando outra, qualquer que seja a prioridade das duas; a regra de interseção vale na ativação (abaixo), seja o voo VLOS, EVLOS ou BVLOS. Volumes que só se encostam não conflitam. Em Zona UTM do tipo U1, use prioridade `1`.
        - Crie a operational intent reference no DSS (`Accepted`), com uma subscription que notifica constraints, e notifique os subscribers.
 
-       Antes de ativar, verifique tudo de novo. O DSS não rejeita a ativação de operational intents que se intersectam: cabe ao SW-USS verificar. Entre operational intents de mesma prioridade, vale a que foi ativada primeiro; entre prioridades diferentes, a de prioridade maior pode ser ativada mesmo intersectando uma de prioridade menor (ver o schema `Priority`). Uma operational intent que intersecta uma constraint não pode ser ativada.
+       Antes de ativar, verifique tudo de novo. O DSS não rejeita a ativação de operational intents que se intersectam: cabe ao SW-USS verificar. Uma operational intent não pode ser ativada enquanto intersectar outra que já foi ativada, de prioridade igual ou maior: entre operational intents de mesma prioridade, vale a que foi ativada primeiro; entre prioridades diferentes, a de prioridade maior pode ser ativada mesmo intersectando uma de prioridade menor (ver o schema `Priority`). Uma operational intent que intersecta uma constraint não pode ser ativada.
     3. **Atendimento aos outros participantes.** O SW-USS responde aos endpoints deste arquivo: fornece os detalhes das suas operational intents a quem os pede, recebe as notificações de mudança em operational intents e constraints da área e fornece a telemetria dos seus voos ao Remote ID. Cada endpoint diz quem o chama.
     4. **Dados das operações.**
        - Das suas operational intents, o SW-USS mantém os detalhes completos, o OVN atual, a versão e a subscription, para responder aos pedidos de detalhes e alterá-las no DSS.
@@ -1715,14 +1715,14 @@ components:
           $ref: '#/components/schemas/OperationalIntentFlightType'
     Priority:
       description: |
-        Prioridade ordinal da operational intent, definida pelo regulador. Operational intents com valor menor têm prioridade menor que todas as de valor maior. Uma operational intent de prioridade menor não pode criar conflito com uma de prioridade maior; uma de prioridade maior pode criar conflito com uma de prioridade menor. O regulador define se operational intents de mesma prioridade podem conflitar.
+        Prioridade ordinal da operational intent, definida pelo regulador. Operational intents com valor menor têm prioridade menor que todas as de valor maior. O regulador define como as prioridades se comportam num conflito.
 
-        No BR-UTM, em Zona UTM do tipo U1, crie operational intents somente com prioridade `1`. Operational intents de mesma prioridade não podem conflitar; numa disputa, vale a que foi ativada primeiro. Entre prioridades diferentes, a operational intent de prioridade maior pode ser ativada mesmo intersectando uma de prioridade menor, e o SW-USS da de prioridade menor, ao ser notificado, altera a operação para eliminar a interseção ou a encerra, em até cinco minutos depois da notificação se ela estiver `Activated` (com o drone fora da interseção ou pousado).
+        No BR-UTM, em Zona UTM do tipo U1, crie operational intents somente com prioridade `1`. Uma operational intent pode ser criada (`Accepted`) mesmo intersectando outra, qualquer que seja a prioridade das duas; a restrição vale na ativação. Entre operational intents de mesma prioridade que se intersectam, vale a que foi ativada primeiro, e a outra não pode ser ativada enquanto a interseção existir. Entre prioridades diferentes, a operational intent de prioridade maior pode ser ativada mesmo intersectando uma de prioridade menor, e o SW-USS da de prioridade menor, ao ser notificado, altera a operação para eliminar a interseção ou a encerra, em até cinco minutos depois da notificação se ela estiver `Activated` (com o drone fora da interseção ou pousado).
       type: integer
       default: 0
     OperationalIntentFlightType:
       description: >-
-        Tipo de voo da operational intent, declarado pelo operador. No BR-UTM, por enquanto, não há diferença entre voos VLOS, EVLOS e BVLOS na desconflitação: nenhuma operational intent pode intersectar outra, qualquer que seja o tipo de voo.
+        Tipo de voo da operational intent, declarado pelo operador. No BR-UTM, por enquanto, não há diferença entre voos VLOS, EVLOS e BVLOS na desconflitação: a mesma regra de interseção vale na ativação, qualquer que seja o tipo de voo.
       anyOf:
       - $ref: '#/components/schemas/FlightType'
     OperationalIntent:
