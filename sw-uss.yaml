@@ -1,7 +1,7 @@
 openapi: 3.0.2
 info:
   title: SW-USS
-  version: 1.0.1
+  version: 1.0.2
   description: |
     Endpoints que todo SW-USS (Gerenciador de Operações) expõe aos demais participantes do BR-UTM. O seu SW-USS também chama estes mesmos endpoints nos outros SW-USS: o contrato é o mesmo nos dois sentidos.
 
@@ -77,7 +77,7 @@ info:
 
     ## Logs e ocorrências
 
-    O SW-USS registra os logs do sistema inteiro, de todas as suas partes e domínios. Isso inclui: as mensagens trocadas com qualquer participante do ECO-UTM (o Auth Server, o DSS, o Provedor de Zona UTM, os Gerenciadores de Constraints, os outros SW-USS etc.), nos dois sentidos, inclusive as que ficaram sem resposta, e não só as trocadas com o DSS e com outros SW-USS, que a ASTM F3548-21 (§5.9) pede; os avisos dados ao operador e as entradas dele; qual operador é responsável por cada operational intent; as tentativas de planejamento negadas por conflito; e as posições do drone usadas no monitoramento de conformidade. Todos os horários ficam em UTC, sem ajuste local, e correspondem ao momento do evento.
+    O SW-USS registra os logs do sistema inteiro, de todas as suas partes e domínios. Isso inclui: as mensagens trocadas com qualquer participante do ECO-UTM (o Auth Server, o DSS, o Provedor de Zona UTM, os Gerenciadores de Constraints, os outros SW-USS etc.), nos dois sentidos, inclusive as que ficaram sem resposta, e não só as trocadas com o DSS e com outros SW-USS, que a ASTM F3548-21 (§5.9) pede; os avisos dados ao operador e as entradas dele; qual operador é responsável por cada operational intent; as tentativas de ativação negadas por conflito; e as posições do drone usadas no monitoramento de conformidade. Todos os horários ficam em UTC, sem ajuste local, e correspondem ao momento do evento.
 
     Os logs são organizados em **log sets**, que o DECEA lista em `GET /uss/v1/log_sets` e obtém em `GET /uss/v1/log_sets/{log_set_id}`:
 
@@ -833,7 +833,7 @@ paths:
         - `messages`: mensagens trocadas com qualquer participante do ECO-UTM, nos dois sentidos, inclusive as que ficaram sem resposta;
         - `operator_notifications` e `operator_inputs`: avisos dados ao operador e entradas dele;
         - `operator_associations`: qual operador é responsável por cada operational intent;
-        - `planning_attempts`: tentativas de planejamento negadas por conflito;
+        - `planning_attempts`: tentativas de ativação negadas por conflito (o planejamento não é negado por conflito);
         - `operational_intent_positions`: posições do drone usadas no monitoramento de conformidade.
 
         Todos os horários ficam em UTC, sem ajuste local, e correspondem ao momento do evento. Responda `404` se o log set não existir ou não estiver mais guardado.
@@ -1975,7 +1975,7 @@ components:
           default: []
         planning_attempts:
           description: >-
-            Para um SW-USS que gerencia operational intents: casos em que uma operational intent não pôde ser planejada ou replanejada por conflito com outras operational intents ou constraints.
+            Para um SW-USS que gerencia operational intents: casos em que uma operational intent não pôde ser ativada por conflito com outras operational intents ou constraints. O planejamento não é negado por conflito, e por isso não entra aqui.
           type: array
           items:
             $ref: '#/components/schemas/PlanningRecord'

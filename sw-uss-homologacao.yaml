@@ -1,7 +1,7 @@
 openapi: 3.0.2
 info:
   title: 'SW-USS: homologação'
-  version: 1.0.0
+  version: 1.0.2
   description: |
     Interfaces de teste que o SW-USS expõe para a homologação. Quem chama é o BR-UTM Lab (DECEA), não os outros SW-USS; a interface de Versioning também é consultada em produção por um serviço do DECEA.
 
@@ -416,11 +416,11 @@ paths:
                     flight_plan_status: OkToFly
                     includes_advisories: NoAdvisoriesOrConditions
                 rejeitado:
-                  summary: Voo rejeitado por conflito
+                  summary: Ativação rejeitada por conflito
                   value:
                     planning_result: Rejected
-                    notes: O voo pedido intersecta a operational intent c036326c-c97b-4926-bf9f-c60dc83d2b57, de outro SW-USS.
-                    flight_plan_status: NotPlanned
+                    notes: O voo intersecta a operational intent c036326c-c97b-4926-bf9f-c60dc83d2b57, de outro SW-USS, já ativada e de mesma prioridade.
+                    flight_plan_status: Planned
                     includes_advisories: AtLeastOneAdvisoryOrCondition
           description: Os dados foram processados com sucesso.
         '401':
@@ -441,7 +441,7 @@ paths:
         - `flight_plan.basic_information.usage_state` diz o que o usuário está fazendo: `Planned` (voo planejado), `InUse` (voo em andamento) ou `Closed` (voo encerrado).
         - `execution_style`: `Hypothetical` (só informe o resultado provável), `IfAllowed` (execute se for permitido) ou `InReality` (o usuário já está fazendo isso, seja permitido ou não).
         - `flight_plan.telemetry` traz posições a entregar ao seu sistema nos instantes indicados, como se viessem do drone; elas alimentam o monitoramento de conformidade.
-        - Responda com `planning_result` (`Completed`, `Rejected`, `Failed` ou `NotSupported`) e `flight_plan_status`. Em qualquer resultado diferente de `Completed`, explique o motivo em `notes`. Por exemplo, um pedido que conflita com outra operational intent resulta em `Rejected`.
+        - Responda com `planning_result` (`Completed`, `Rejected`, `Failed` ou `NotSupported`) e `flight_plan_status`. Em qualquer resultado diferente de `Completed`, explique o motivo em `notes`. Um pedido de voo em `Planned` que conflita com outra operational intent não é rejeitado por esse conflito; já a passagem para `InUse` é rejeitada (`Rejected`) se o voo tiver conflitos pelas regras de ativação de `sw-uss.yaml`.
         - Se o `request_id` se repetir, devolva a resposta do primeiro pedido com o mesmo `request_id`, sem executar a ação de novo. Responda `409` só se essa resposta não estiver mais disponível.
 
         Os testes também verificam o comportamento do SW-USS com prioridades maiores e menores, embora no BR-UTM se use uma única prioridade por enquanto.
@@ -529,7 +529,7 @@ paths:
                     - observed_at:
                         value: '2026-11-05T13:50:02Z'
                         format: RFC3339
-                      message: 'Conflito com outra operação na área: o voo não pode ser planejado.'
+                      message: 'Conflito com outra operação ativa na área: o voo não pode ser ativado.'
                       conflicts: Single
           description: As notificações ao usuário foram obtidas com sucesso.
         '400':
